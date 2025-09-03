@@ -1692,7 +1692,7 @@ const ROuND_FULL = 8
 const ROUND_PARTIAL = 56
 
 var GetPermutation = sync.OnceValue(func() *poseidon2.Permutation {
-	return poseidon2.NewPermutationWithSeed(WIDTH, ROuND_FULL, ROUND_PARTIAL, "PLACEHOLDER_PROJECT_NAME_PLACEHOLDER_POSEIDON2_HASH_SEED")
+	return poseidon2.NewPermutationWithSeed(WIDTH, ROuND_FULL, ROUND_PARTIAL, "EON_POSEIDON2_HASH_SEED")
 })
 
 func compress(x, y fr.Element) fr.Element {

@@ -24,7 +24,7 @@ import (
 )
 
 var permutation = sync.OnceValue(func() *poseidon2.Permutation {
-	return poseidon2.NewPermutationWithSeed(HASH_T, HASH_RF, HASH_RP, "PLACEHOLDER_PROJECT_NAME_PLACEHOLDER_POSEIDON2_HASH_SEED")
+	return poseidon2.NewPermutationWithSeed(HASH_T, HASH_RF, HASH_RP, "EON_POSEIDON2_HASH_SEED")
 })
 
 func DecomposeG1(val bls12381.G1Affine) [2][2]fr.Element {
@@ -105,7 +105,7 @@ func download_srs_ck(pathck string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	var buf bytes.Buffer
-	bar := progressbar.DefaultBytes(resp.ContentLength, "downloading srs ...")
+	bar := progressbar.DefaultBytes(resp.ContentLength, "Downloading SRSCK")
 	if _, err := io.Copy(io.MultiWriter(&buf, bar), resp.Body); err != nil {
 		return nil, err
 	}
