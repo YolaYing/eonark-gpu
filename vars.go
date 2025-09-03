@@ -1,8 +1,9 @@
 package eonark
 
 import (
-	"encoding/hex"
 	"log"
+	"os"
+	"path"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	bls12381 "github.com/consensys/gnark-crypto/ecc/bls12-381"
@@ -17,12 +18,23 @@ const SRS_SIZE = (1 << 24) + 3
 const HASH_T = 2
 const HASH_RF = 8
 const HASH_RP = 56
-const SRS_DOWNLOAD_URL = "https://github.com/eon-protocol/eonark/releases/download/bin/SRS.PK.BIN"
+const SRS_DOWNLOAD_URL = "https://github.com/eon-protocol/eonark/releases/download/bin/SRS.CK.BIN"
 
 var FIELD = ecc.BLS12_381.ScalarField()
 var OPT_PROVER = plonk.GetNativeProverOptions(FIELD, FIELD)
 var OPT_VERIFIER = plonk.GetNativeVerifierOptions(FIELD, FIELD)
 var COSET_SHIFT = fr.NewElement(7)
+var DATA_CACHE_DIR = func() (dir string) {
+	var err error
+	if dir, err = os.UserCacheDir(); err != nil {
+		log.Fatalln(err)
+	}
+	dir = path.Join(dir, "eonark")
+	if err = os.MkdirAll(dir, os.ModePerm); err != nil {
+		log.Fatalln(err)
+	}
+	return
+}()
 var CID_GAMMA = func() (val fr.Element) {
 	val.SetString("12136437972164249638515815863518169381248623050802518443499856540155713785793")
 	return
@@ -58,46 +70,30 @@ var SRS_VK = func() (vk kzg.VerifyingKey) {
 	vk.Lines[1] = bls12381.PrecomputeLines(vk.G2[1])
 	return
 }()
-var SRS_PK_HASH = func() (val [32]byte) {
-	data, err := hex.DecodeString("8851342145732a79116fb72fc70f91b1f6360693174cd51b645944dab353e683")
-	if err != nil {
-		log.Fatalln(err)
-	}
-	copy(val[:], data)
-	return
-}()
-var SRS_LK_HASH = func() (val [24][32]byte) {
-	for i, v := range []string{
-		"ce04c320a873fe535caec3f8082f57c33cff6ca2012fe84667d1424351f3d12e",
-		"572cd55167233da429432edf01103ae633b17d1b7817597d45efb11f9ee17d72",
-		"11c4bb73c072769ad60947e8137f958bcc6e5dd0b13327bebd2a9d9acecb72a1",
-		"44022d1fd56aa9ee34effc7036b5142b3e14dba7db78ab5720a959d1c2e9cd0f",
-		"f3e7bad8b8811c8828c911328ccf8a5721ed6656cb10da5dddb9f959788d4622",
-		"97eec8b973855654a43dfc6086331652f5e032f03d30094f741dfca45c44cb8e",
-		"31675f96198f08906630b83fd7798bd19543ec40930d559273feab5ae1b9413f",
-		"b472723ce930c700bc8431329b213ae84705653e50138d328984bf63f3c708c7",
-		"ebd3437825d174ea3e2479b9b133e79945bf1239c926137dda0affbafe5fa8dd",
-		"3cc29b9578a5bff42cdbe2d53e5664f01bbfe9dc905264d1a4a1c69d57e72d65",
-		"4edface1def21228d725628a13404a21da91954e09d8bea8d4dc26a1b6b33dbc",
-		"58ecbc013c93b698b637f625f5fc1b7c2470623c716fa43bbd7d8766e405334c",
-		"e5e862b82b4003124baaec31ce6854dea0f2f8fc209d921c4a837b8b4fdc4fb2",
-		"94926b30804ccf229a4aed53e5e0adfc4fb38f74b221bd2600e791d39d665148",
-		"14ebf2d83e74c53cc7247abb2c389e537afdb56dcd1116bfcef4ee04d5f53ea3",
-		"63ccf7ccf79cf3b7a49a0de04fb9e094d926775324a1ff1039a45f91dd84af2c",
-		"6a59062c73fa57c63b3e22231ffef57c768fa9b178c749020525a7a1fcb2225f",
-		"e5b9044a981c24ff07a938bb0942766978dd28167b7e38246fdc108481d541a4",
-		"c1447cfb226df90d929745f2f79b86766001b3b8d7ea53e5698494fe8aa98a8a",
-		"4910250929b6cabbaa55c1b1dc50ad3b695acb1942e96eb4cd8abc74cdd3c1a6",
-		"5c2d17655bb3b3823a7436dc9b8da2660455767f2cf9cac1cc20ed5d9d038eb5",
-		"33b5fb5cff47d415238a9064d8e4fa395798519929db5c84dd20f7dfb88ae66a",
-		"e5b9044a981c24ff07a938bb0942766978dd28167b7e38246fdc108481d541a4", // TODO
-		"e5b9044a981c24ff07a938bb0942766978dd28167b7e38246fdc108481d541a4", // TODO
-	} {
-		data, err := hex.DecodeString(v)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		copy(val[i][:], data)
-	}
-	return
-}()
+var SRS_CK_HASH = "8851342145732a79116fb72fc70f91b1f6360693174cd51b645944dab353e683"
+var SRS_LK_HASH = []string{
+	"ce04c320a873fe535caec3f8082f57c33cff6ca2012fe84667d1424351f3d12e",
+	"572cd55167233da429432edf01103ae633b17d1b7817597d45efb11f9ee17d72",
+	"11c4bb73c072769ad60947e8137f958bcc6e5dd0b13327bebd2a9d9acecb72a1",
+	"44022d1fd56aa9ee34effc7036b5142b3e14dba7db78ab5720a959d1c2e9cd0f",
+	"f3e7bad8b8811c8828c911328ccf8a5721ed6656cb10da5dddb9f959788d4622",
+	"97eec8b973855654a43dfc6086331652f5e032f03d30094f741dfca45c44cb8e",
+	"31675f96198f08906630b83fd7798bd19543ec40930d559273feab5ae1b9413f",
+	"b472723ce930c700bc8431329b213ae84705653e50138d328984bf63f3c708c7",
+	"ebd3437825d174ea3e2479b9b133e79945bf1239c926137dda0affbafe5fa8dd",
+	"3cc29b9578a5bff42cdbe2d53e5664f01bbfe9dc905264d1a4a1c69d57e72d65",
+	"4edface1def21228d725628a13404a21da91954e09d8bea8d4dc26a1b6b33dbc",
+	"58ecbc013c93b698b637f625f5fc1b7c2470623c716fa43bbd7d8766e405334c",
+	"e5e862b82b4003124baaec31ce6854dea0f2f8fc209d921c4a837b8b4fdc4fb2",
+	"94926b30804ccf229a4aed53e5e0adfc4fb38f74b221bd2600e791d39d665148",
+	"14ebf2d83e74c53cc7247abb2c389e537afdb56dcd1116bfcef4ee04d5f53ea3",
+	"63ccf7ccf79cf3b7a49a0de04fb9e094d926775324a1ff1039a45f91dd84af2c",
+	"6a59062c73fa57c63b3e22231ffef57c768fa9b178c749020525a7a1fcb2225f",
+	"e5b9044a981c24ff07a938bb0942766978dd28167b7e38246fdc108481d541a4",
+	"c1447cfb226df90d929745f2f79b86766001b3b8d7ea53e5698494fe8aa98a8a",
+	"4910250929b6cabbaa55c1b1dc50ad3b695acb1942e96eb4cd8abc74cdd3c1a6",
+	"5c2d17655bb3b3823a7436dc9b8da2660455767f2cf9cac1cc20ed5d9d038eb5",
+	"33b5fb5cff47d415238a9064d8e4fa395798519929db5c84dd20f7dfb88ae66a",
+	"505d84394c7bc938ff6035e69e7f368bede209c2b4cf739d6bbc85b27aac6121",
+	"71d9e0c811abe6b79b3812cf1e4268aea71a9abd963d5814e7564ee6a8a368a3",
+}

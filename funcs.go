@@ -66,102 +66,54 @@ func HashSum(val ...fr.Element) fr.Element {
 	return ret
 }
 
-func read_proving_key(sc, sl int) (pk kzg.ProvingKey, lk kzg.ProvingKey, err error) {
-	var dir string
-	dir, err = os.UserCacheDir()
-	if err != nil {
-		return
-	}
-	dir = path.Join(dir, "eonark")
-	if err = os.MkdirAll(dir, os.ModePerm); err != nil {
-		return
-	}
+func read_proving_key(sc, sl int) (ck kzg.ProvingKey, lk kzg.ProvingKey, err error) {
 	logsl := bits.TrailingZeros(uint(sl))
-	if bits.OnesCount(uint(sl)) != 1 {
-		err = errors.New("sl should be power of 2")
+	if bits.OnesCount(uint(sl)) != 1 || logsl >= len(SRS_LK_HASH) {
+		err = errors.New("invalid sl")
 		return
 	}
-	if logsl >= len(SRS_LK_HASH) {
-		err = errors.New("sl too large")
-		return
-	}
-	pathpk := path.Join(dir, "SRS.PK.BIN")
-	pathlk := path.Join(dir, fmt.Sprintf("SRS.LK.%v.BIN", logsl))
-	for i := 0; i < 3; i++ {
-		if i > 0 {
-			log.Printf("reloading srs ...\n")
-		}
-		bytepk, errpk := os.ReadFile(pathpk)
-		hashpk := sha256.Sum256(bytepk)
-		if errpk != nil || hashpk != SRS_PK_HASH {
-			if err = download_srs_cache(pathpk); err != nil {
-				return
-			}
-			continue
-		}
-		buf := make([]byte, 8)
-		var g1 bls12381.G1Affine
-		readerpk := bytes.NewReader(bytepk)
-		pk.G1 = make([]bls12381.G1Affine, 0, sc)
-		for n := 0; n < sc; n++ {
-			for i := 0; i < 6; i++ {
-				if _, err = io.ReadFull(readerpk, buf); err != nil {
-					return
-				}
-				g1.X[i] = binary.BigEndian.Uint64(buf)
-			}
-			for i := 0; i < 6; i++ {
-				if _, err = io.ReadFull(readerpk, buf); err != nil {
-					return
-				}
-				g1.Y[i] = binary.BigEndian.Uint64(buf)
-			}
-			pk.G1 = append(pk.G1, g1)
-		}
-		bytelk, errlk := os.ReadFile(pathlk)
-		hashlk := sha256.Sum256(bytelk)
-		if errlk != nil || hashlk != SRS_LK_HASH[logsl] {
-			log.Println(errlk, hex.EncodeToString(hashlk[:]))
-			lk.G1, err = generate_srs_lk(pathlk, pk.G1[:sl], logsl)
+	pathck := path.Join(DATA_CACHE_DIR, "SRS.CK.BIN")
+	pathlk := path.Join(DATA_CACHE_DIR, fmt.Sprintf("SRS.LK.%v.BIN", logsl))
+	byteck, errck := os.ReadFile(pathck)
+	sumck := sha256.Sum256(byteck)
+	sumckstr := hex.EncodeToString(sumck[:])
+	if errck != nil || sumckstr != SRS_CK_HASH {
+		if byteck, err = download_srs_ck(pathck); err != nil {
 			return
 		}
-		readerlk := bytes.NewReader(bytelk)
-		lk.G1 = make([]bls12381.G1Affine, 0, sl)
-		for n := 0; n < sl; n++ {
-			for i := 0; i < 6; i++ {
-				if _, err = io.ReadFull(readerlk, buf); err != nil {
-					return
-				}
-				g1.X[i] = binary.BigEndian.Uint64(buf)
-			}
-			for i := 0; i < 6; i++ {
-				if _, err = io.ReadFull(readerlk, buf); err != nil {
-					return
-				}
-				g1.Y[i] = binary.BigEndian.Uint64(buf)
-			}
-			lk.G1 = append(lk.G1, g1)
-		}
+	}
+	if ck.G1, err = parse_proving_key(byteck, sc); err != nil {
+		return
+	}
+	bytelk, errlk := os.ReadFile(pathlk)
+	sumlk := sha256.Sum256(bytelk)
+	sumlkstr := hex.EncodeToString(sumlk[:])
+	if errlk != nil || sumlkstr != SRS_LK_HASH[logsl] {
+		lk.G1, err = generate_srs_lk(pathlk, ck.G1[:sl])
+		return
+	}
+	if lk.G1, err = parse_proving_key(bytelk, sl); err != nil {
 		return
 	}
 	return
 }
 
-func download_srs_cache(pathpk string) error {
+func download_srs_ck(pathck string) ([]byte, error) {
 	resp, err := http.Get(SRS_DOWNLOAD_URL)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	var buf bytes.Buffer
 	bar := progressbar.DefaultBytes(resp.ContentLength, "downloading srs ...")
 	if _, err := io.Copy(io.MultiWriter(&buf, bar), resp.Body); err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile(pathpk, buf.Bytes(), 0o644)
+	byteck := buf.Bytes()
+	return byteck, os.WriteFile(pathck, byteck, 0o644)
 }
 
-func generate_srs_lk(pathlk string, g1 []bls12381.G1Affine, logsl int) ([]bls12381.G1Affine, error) {
+func generate_srs_lk(pathlk string, g1 []bls12381.G1Affine) ([]bls12381.G1Affine, error) {
 	lk, err := kzg.ToLagrangeG1(g1)
 	if err != nil {
 		return nil, err
@@ -183,4 +135,27 @@ func generate_srs_lk(pathlk string, g1 []bls12381.G1Affine, logsl int) ([]bls123
 		return nil, err
 	}
 	return lk, nil
+}
+
+func parse_proving_key(bytepk []byte, size int) (val []bls12381.G1Affine, err error) {
+	var g1 bls12381.G1Affine
+	buf := make([]byte, 8)
+	reader := bytes.NewReader(bytepk)
+	val = make([]bls12381.G1Affine, 0, size)
+	for n := 0; n < size; n++ {
+		for i := 0; i < 6; i++ {
+			if _, err = io.ReadFull(reader, buf); err != nil {
+				return
+			}
+			g1.X[i] = binary.BigEndian.Uint64(buf)
+		}
+		for i := 0; i < 6; i++ {
+			if _, err = io.ReadFull(reader, buf); err != nil {
+				return
+			}
+			g1.Y[i] = binary.BigEndian.Uint64(buf)
+		}
+		val = append(val, g1)
+	}
+	return
 }
