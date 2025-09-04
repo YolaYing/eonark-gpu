@@ -3,7 +3,6 @@ package eonark
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -68,22 +67,15 @@ func HashSum(val ...fr.Element) fr.Element {
 
 func ParseProvingKey(bytepk []byte, size int) (val []bls12381.G1Affine, err error) {
 	var g1 bls12381.G1Affine
-	buf := make([]byte, 8)
+	buf := make([]byte, 96)
 	reader := bytes.NewReader(bytepk)
 	val = make([]bls12381.G1Affine, 0, size)
-	for n := 0; n < size; n++ {
-		for i := 0; i < 6; i++ {
-			if _, err = io.ReadFull(reader, buf); err != nil {
-				return
-			}
-			g1.X[i] = binary.BigEndian.Uint64(buf)
+	for i := 0; i < size; i++ {
+		if _, err = io.ReadFull(reader, buf); err != nil {
+			return
 		}
-		for i := 0; i < 6; i++ {
-			if _, err = io.ReadFull(reader, buf); err != nil {
-				return
-			}
-			g1.Y[i] = binary.BigEndian.Uint64(buf)
-		}
+		g1.X.SetBytes(buf[:48])
+		g1.Y.SetBytes(buf[48:])
 		val = append(val, g1)
 	}
 	return
@@ -145,15 +137,12 @@ func generate_srs_lk(pathlk string, g1 []bls12381.G1Affine) ([]bls12381.G1Affine
 	}
 	var buf bytes.Buffer
 	for _, xy := range lk {
-		for _, v := range xy.X {
-			if err := binary.Write(&buf, binary.BigEndian, v); err != nil {
-				return nil, err
-			}
+		x, y := xy.X.Bytes(), xy.Y.Bytes()
+		if _, err := buf.Write(x[:]); err != nil {
+			return nil, err
 		}
-		for _, v := range xy.Y {
-			if err := binary.Write(&buf, binary.BigEndian, v); err != nil {
-				return nil, err
-			}
+		if _, err := buf.Write(y[:]); err != nil {
+			return nil, err
 		}
 	}
 	if err := os.WriteFile(pathlk, buf.Bytes(), 0o644); err != nil {

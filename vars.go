@@ -69,7 +69,7 @@ var SRS_VK = func() (vk kzg.VerifyingKey) {
 	vk.Lines[1] = bls12381.PrecomputeLines(vk.G2[1])
 	return
 }()
-var SRS_CK_HASH = "9e0bbda56331be3dd4342c123518dc876898068047a30bb9b34f0c199f365049"
+var SRS_CK_HASH = "1c33783ee0f167b6def007928cfbe046bcd76242eecd59df7d3f5241e3b50b22"
 var SRS_LK_HASH = []string{
 	"6672c70f403f1209e7e24133ac01cac5054fa8c85da1588c34e325a9627fe9a1",
 	"c20b2c38c57eef581229d51bf78c4e5dbd0e7d55700f3baf2eb4907be6a73c9d",
@@ -95,4 +95,5 @@ var SRS_LK_HASH = []string{
 	"fb430376ceb1126f4022feb15b12a77dead9ca82cf1bf099def241cbd2173fe0",
 	"abe05df34cf9a31cabcd01fbdc3769f1d866664c2711b5fc3c05161ed44e0066",
 	"72c55cf432c82b8c48257231277ac8a4c62a52e8fd8800a170daa1004e30f9e1",
+	"1ae3fa8d035a86975dc029db25bd1a43c7d9ddc52830a7bfc391beac4446f396",
 }
