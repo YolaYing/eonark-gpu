@@ -29,7 +29,7 @@ func (me *Pk) Compile(circuit frontend.Circuit) error {
 	if nc != 1 {
 		return fmt.Errorf("number of commitments is %d not 1", nc)
 	}
-	spkc, spkl, err := read_proving_key(plonk.SRSSize(ccs))
+	spkc, spkl, err := ReadProvingKey(plonk.SRSSize(ccs))
 	if err != nil {
 		return err
 	}
@@ -45,7 +45,7 @@ func (me *Pk) Vk() Vk {
 }
 
 func (me *Pk) ToGnarkProvingKey() plonk.ProvingKey {
-	spkc, spkl, err := read_proving_key(plonk.SRSSize(&me.ccs))
+	spkc, spkl, err := ReadProvingKey(plonk.SRSSize(&me.ccs))
 	if err != nil {
 		log.Fatalln(err)
 	}
