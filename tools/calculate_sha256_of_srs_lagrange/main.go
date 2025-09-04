@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -14,6 +13,7 @@ import (
 )
 
 func main() {
+
 	file, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		log.Fatalln(err)
@@ -33,15 +33,12 @@ func main() {
 		}
 		hasher := sha256.New()
 		for _, xy := range lk {
-			for _, v := range xy.X {
-				if err := binary.Write(hasher, binary.BigEndian, v); err != nil {
-					log.Fatalln(err)
-				}
+			x, y := xy.X.Bytes(), xy.Y.Bytes()
+			if _, err := hasher.Write(x[:]); err != nil {
+				log.Fatalln(err)
 			}
-			for _, v := range xy.Y {
-				if err := binary.Write(hasher, binary.BigEndian, v); err != nil {
-					log.Fatalln(err)
-				}
+			if _, err := hasher.Write(y[:]); err != nil {
+				log.Fatalln(err)
 			}
 		}
 		sum := hasher.Sum(nil)
