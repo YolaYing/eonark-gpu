@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/eon-protocol/eonark"
 	"github.com/eon-protocol/eonark/accounts/permissionless"
@@ -13,7 +15,9 @@ func main() {
 	if err := pk.Compile(&permissionless.Account{}); err != nil {
 		log.Fatalln(err)
 	}
-	vk := pk.Vk()
-	addr := vk.Address()
-	fmt.Println("addr:", addr.Text(16))
+	enc := hex.NewEncoder(os.Stdout)
+	if _, err := pk.WriteTo(enc); err != nil {
+		log.Fatalln(err)
+	}
+	fmt.Println()
 }
