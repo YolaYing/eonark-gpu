@@ -153,6 +153,10 @@ func (me *Vk) Verify(proof *Proof, publics [4]fr.Element) error {
 	)
 }
 
+func (me *Vk) Address() fr.Element {
+	return HashCompress(HashSum(HashG1(me.S1), HashG1(me.S2), HashG1(me.S3), HashG1(me.QL), HashG1(me.QR), HashG1(me.QM), HashG1(me.QO), HashG1(me.QK), HashG1(me.QC)), HashCompress(fr.NewElement(uint64(me.CI)), fr.NewElement(uint64(me.SZ))))
+}
+
 func (me *Vk) WriteTo(w io.Writer) (int64, error) {
 	enc := bls12381.NewEncoder(w)
 	if err := enc.Encode(&me.S1); err != nil {

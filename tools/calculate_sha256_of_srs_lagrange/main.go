@@ -13,7 +13,6 @@ import (
 )
 
 func main() {
-
 	file, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		log.Fatalln(err)
