@@ -63,3 +63,52 @@ func OnDeviceCommit(p []fr.Element, G1Device icicle_core.DeviceSlice) (kzg.Diges
 
 	return kzg.Digest(res), icicle_runtime.Success
 }
+
+func OnDeviceOpen(p []fr.Element, point fr.Element, base icicle_core.DeviceSlice) (kzg.OpeningProof, icicle_runtime.EIcicleError) {
+	var proof kzg.OpeningProof
+
+	// 1) 声明值（CPU 做即可，代价可忽略）
+	proof.ClaimedValue = eval(p, point)
+
+	// 2) 构造 H(X) = (p(X)-p(point)) / (X-point)
+	_p := make([]fr.Element, len(p))
+	copy(_p, p)
+	h := dividePolyByXminusA(_p, proof.ClaimedValue, point)
+
+	// 3) 对 H 做一次设备端承诺：commit(H)
+	//    注意 bases 需要与标量长度一致，这里对子片到 len(h)
+	subBase := base.RangeTo(len(h), false)
+	dig, st := OnDeviceCommit(h, subBase)
+	if st != icicle_runtime.Success {
+		return kzg.OpeningProof{}, st
+	}
+
+	// 4) 组装返回值
+	proof.H = kzg.Digest(dig) // Digest 是 G1Affine 的别名
+	return proof, icicle_runtime.Success
+}
+
+func eval(p []fr.Element, point fr.Element) fr.Element {
+	var res fr.Element
+	n := len(p)
+	if n == 0 {
+		return res // 0
+	}
+	res.Set(&p[n-1])
+	for i := n - 2; i >= 0; i-- {
+		res.Mul(&res, &point).Add(&res, &p[i])
+	}
+	return res
+}
+
+func dividePolyByXminusA(f []fr.Element, fa, a fr.Element) []fr.Element {
+	// f <- f - f(a)
+	f[0].Sub(&f[0], &fa)
+
+	var t fr.Element
+	for i := len(f) - 2; i >= 0; i-- {
+		t.Mul(&f[i+1], &a)
+		f[i].Add(&f[i], &t)
+	}
+	return f[1:]
+}

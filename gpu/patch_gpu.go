@@ -108,10 +108,10 @@ func (pk *ProvingKey) setupDevicePointers(spr *cs.SparseR1CS) error {
 	icicle_runtime.RunOnDevice(&pk.deviceInfo.Device, func(args ...any) {
 		defer close(done)
 
-		g1Host := icicle_core.HostSlice[curve.G1Affine](pk.Kzg.G1[:n+3])
+		g1Host := icicle_core.HostSlice[curve.G1Affine](pk.Kzg.G1)
 		g1Host.CopyToDevice(&pk.deviceInfo.G1Device.G1, true)
 
-		g1LagHost := icicle_core.HostSlice[curve.G1Affine](pk.KzgLagrange.G1[:n])
+		g1LagHost := icicle_core.HostSlice[curve.G1Affine](pk.KzgLagrange.G1)
 		g1LagHost.CopyToDevice(&pk.deviceInfo.G1Device.G1Lagrange, true)
 
 		if st := icicle_bls12_381.AffineFromMontgomery(pk.deviceInfo.G1Device.G1); st != icicle_runtime.Success {
@@ -531,7 +531,11 @@ func (s *instance) commitToPolyAndBlinding(p, b *iop.Polynomial) (commit curve.G
 
 	// we add in the blinding contribution
 	n := int(s.domain0.Cardinality)
-	cb := commitBlindingFactor(n, b, s.pk.Kzg)
+	// cb := commitBlindingFactor(n, b, s.pk.Kzg)
+	cb, err2 := commitBlindingFactorGPUOrCPU(n, b, s.pk)
+	if err2 != nil {
+		return curve.G1Affine{}, err2
+	}
 	commit.Add(&commit, &cb)
 
 	return
@@ -677,7 +681,9 @@ func (s *instance) openZ() (err error) {
 	zetaShifted.Mul(&s.zeta, &s.pk.Vk.Generator)
 	s.blindedZ = getBlindedCoefficients(s.x[id_Z], s.bp[id_Bz])
 	// open z at zeta
-	s.proof.ZShiftedOpening, err = kzg.Open(s.blindedZ, zetaShifted, s.pk.Kzg)
+	// s.proof.ZShiftedOpening, err = kzg.Open(s.blindedZ, zetaShifted, s.pk.Kzg)
+	s.proof.ZShiftedOpening, err = OpenOnGPUOrCPU(s.blindedZ, zetaShifted, s.pk)
+
 	if err != nil {
 		return err
 	}
@@ -1945,4 +1951,74 @@ func commitOnGPUOrCPU(coeffs []fr.Element, pk *ProvingKey, useLagrange bool) (cu
 		return kzg.Commit(coeffs, pk.KzgLagrange)
 	}
 	return kzg.Commit(coeffs, pk.Kzg)
+}
+
+// commits to a polynomial of the form b*(Xⁿ-1) where b is of small degree
+// Prefer GPU (icicle v3); fallback to CPU if GPU unavailable or returns error.
+func commitBlindingFactorGPUOrCPU(n int, b *iop.Polynomial, pk *ProvingKey) (curve.G1Affine, error) {
+	cp := b.Coefficients()
+	np := b.Size()
+
+	// --- GPU path ---
+	if HasIcicle && pk != nil && pk.deviceInfo != nil {
+		var (
+			lo, hi     kzg.Digest
+			stLo, stHi icicle_runtime.EIcicleError
+		)
+
+		done := make(chan struct{})
+		icicle_runtime.RunOnDevice(&pk.deviceInfo.Device, func(args ...any) {
+			defer close(done)
+
+			// bases for lo: G1[0:np]
+			baseLo := pk.deviceInfo.G1Device.G1.RangeTo(np, false)
+
+			// bases for hi: G1[n:n+np]
+			// 注意：根据 icicle-gnark v3 的 DeviceSlice API，这里通常是 Range(start, end, keepMont)
+			// 若你的封装叫法不同（如 Slice/Window/Subrange），把这行按实际方法名替换即可。
+			baseHi := pk.deviceInfo.G1Device.G1.Range(n, n+np, false)
+
+			lo, stLo = kzg_bls12_381.OnDeviceCommit(cp, baseLo)
+			if stLo == icicle_runtime.Success {
+				hi, stHi = kzg_bls12_381.OnDeviceCommit(cp, baseHi)
+			}
+		})
+		<-done
+
+		if stLo == icicle_runtime.Success && stHi == icicle_runtime.Success {
+			res := curve.G1Affine(hi)
+			tmp := curve.G1Affine(lo)
+			res.Sub(&res, &tmp)
+			return res, nil
+		}
+
+		log.Printf("[GPU failed -> CPU] commit blinding factor (lo=%s hi=%s)", stLo.AsString(), stHi.AsString())
+	}
+
+	// --- CPU fallback ---
+	return commitBlindingFactor(n, b, pk.Kzg), nil
+}
+
+func OpenOnGPUOrCPU(p []fr.Element, point fr.Element, pk *ProvingKey) (kzg.OpeningProof, error) {
+	// 尝试 GPU
+	if HasIcicle && pk != nil && pk.deviceInfo != nil {
+		var pr kzg.OpeningProof
+		var st icicle_runtime.EIcicleError
+
+		done := make(chan struct{})
+		icicle_runtime.RunOnDevice(&pk.deviceInfo.Device, func(args ...any) {
+			defer close(done)
+			// 传入 monomial SRS（和 Commit 一致）
+			pr, st = kzg_bls12_381.OnDeviceOpen(p, point, pk.deviceInfo.G1Device.G1)
+		})
+		<-done
+
+		if st == icicle_runtime.Success {
+			return pr, nil
+		}
+		log.Printf("[GPU failed -> CPU] kzg.Open: %s", st.AsString())
+	}
+
+	// CPU 回退
+	return kzg.Open(p, point, pk.Kzg)
 }
