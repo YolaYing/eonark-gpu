@@ -7,6 +7,7 @@ import (
 
 	"github.com/consensys/gnark-crypto/ecc/bls12-381/fr"
 	"github.com/consensys/gnark-crypto/ecc/bls12-381/kzg"
+	"github.com/consensys/gnark/backend"
 	"github.com/consensys/gnark/backend/plonk"
 	plonkbls12381 "github.com/consensys/gnark/backend/plonk/bls12-381"
 	"github.com/consensys/gnark/constraint"
@@ -78,7 +79,9 @@ func (me *Pk) Prove(assignment frontend.Circuit) ([4]fr.Element, []fr.Element, *
 		return [4]fr.Element{}, nil, nil, err
 	}
 	// gp, err := plonk.Prove(&me.ccs, me.ToGnarkProvingKey(), witness, OPT_PROVER)
-	gp, err := prove(&me.ccs, me.ToGnarkProvingKey().(*plonkbls12381.ProvingKey), witness, OPT_PROVER)
+	// gp, err := prove(&me.ccs, me.ToGnarkProvingKey().(*plonkbls12381.ProvingKey), witness, OPT_PROVER)
+	gp, err := Prove(&me.ccs, me.ToGnarkProvingKey().(*plonkbls12381.ProvingKey), witness, OPT_PROVER, backend.WithIcicleAcceleration())
+
 	if err != nil {
 		return [4]fr.Element{}, nil, nil, err
 	}

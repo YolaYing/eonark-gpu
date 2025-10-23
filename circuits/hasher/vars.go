@@ -13,7 +13,7 @@ const WIDTH = 2
 const ROUND_FULL = 8
 const ROUND_PARTIAL = 56
 const USESEED = true
-const SEED = "PLACEHOLDER_PROJECT_NAME_PLACEHOLDER_POSEIDON2_HASH_SEED"
+const SEED = "EON_POSEIDON2_HASH_SEED"
 
 // GetPermutation returns a native Poseidon2 permutation using the parameters above.
 var GetPermutation = sync.OnceValue(func() *poseidon2.Permutation {

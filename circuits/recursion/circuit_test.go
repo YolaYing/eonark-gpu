@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	// curves and fields
 	"github.com/consensys/gnark-crypto/ecc"
@@ -117,7 +118,10 @@ func Test_Recursion(t *testing.T) {
 	innerAssign := &innerCircuit{X: 1, Y: 1, Z: 1, W: 1}
 
 	// prove: return publics / proof
+	tInner := time.Now()
 	publicsMine, _, proofMine, err := pk.Prove(innerAssign)
+	innerDur := time.Since(tInner)
+	fmt.Printf("[TIMING] inner Prove took %s\n", innerDur)
 	assert.NoError(err)
 
 	// sanity: run verification using verify functions in zk package
@@ -246,7 +250,10 @@ func Test_Recursion(t *testing.T) {
 
 	vkOuter := pkOuter.Vk()
 
+	tOuter := time.Now()
 	publicsOuter, _, proofOuter, err := pkOuter.Prove(assign)
+	outerDur := time.Since(tOuter)
+	fmt.Printf("[TIMING] outer Prove took %s\n", outerDur)
 	if err != nil {
 		t.Fatalf("outer prove: %v", err)
 	}
