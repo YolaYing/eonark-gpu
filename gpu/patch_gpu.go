@@ -1269,27 +1269,46 @@ func coefficients(p []*iop.Polynomial) [][]fr.Element {
 
 // func commitToQuotient(h1, h2, h3 []fr.Element, proof *plonkbls12381.Proof, kzgPk kzg.ProvingKey) error {
 func commitToQuotient(h1, h2, h3 []fr.Element, proof *plonkbls12381.Proof, pk *ProvingKey) error {
-	g := new(errgroup.Group)
+	// g := new(errgroup.Group)
 
-	g.Go(func() (err error) {
-		// proof.H[0], err = kzg.Commit(h1, kzgPk)
-		proof.H[0], err = commitOnGPUOrCPU(h1, pk, false /* monomial */)
-		return
-	})
+	// g.Go(func() (err error) {
+	// 	// proof.H[0], err = kzg.Commit(h1, kzgPk)
+	// 	proof.H[0], err = commitOnGPUOrCPU(h1, pk, false /* monomial */)
+	// 	return
+	// })
 
-	g.Go(func() (err error) {
-		// proof.H[1], err = kzg.Commit(h2, kzgPk)
-		proof.H[1], err = commitOnGPUOrCPU(h2, pk, false /* monomial */)
-		return
-	})
+	// g.Go(func() (err error) {
+	// 	// proof.H[1], err = kzg.Commit(h2, kzgPk)
+	// 	proof.H[1], err = commitOnGPUOrCPU(h2, pk, false /* monomial */)
+	// 	return
+	// })
 
-	g.Go(func() (err error) {
-		// proof.H[2], err = kzg.Commit(h3, kzgPk)
-		proof.H[2], err = commitOnGPUOrCPU(h3, pk, false /* monomial */)
-		return
-	})
+	// g.Go(func() (err error) {
+	// 	// proof.H[2], err = kzg.Commit(h3, kzgPk)
+	// 	proof.H[2], err = commitOnGPUOrCPU(h3, pk, false /* monomial */)
+	// 	return
+	// })
 
-	return g.Wait()
+	// return g.Wait()
+	var err error
+
+	proof.H[0], err = commitOnGPUOrCPU(h1, pk, false /* monomial */)
+	if err != nil {
+		return err
+	}
+
+	proof.H[1], err = commitOnGPUOrCPU(h2, pk, false /* monomial */)
+	if err != nil {
+		return err
+	}
+
+	proof.H[2], err = commitOnGPUOrCPU(h3, pk, false /* monomial */)
+	if err != nil {
+		return err
+	}
+
+	return nil
+
 }
 
 // divideByZH
@@ -1974,8 +1993,6 @@ func commitBlindingFactorGPUOrCPU(n int, b *iop.Polynomial, pk *ProvingKey) (cur
 			baseLo := pk.deviceInfo.G1Device.G1.RangeTo(np, false)
 
 			// bases for hi: G1[n:n+np]
-			// 注意：根据 icicle-gnark v3 的 DeviceSlice API，这里通常是 Range(start, end, keepMont)
-			// 若你的封装叫法不同（如 Slice/Window/Subrange），把这行按实际方法名替换即可。
 			baseHi := pk.deviceInfo.G1Device.G1.Range(n, n+np, false)
 
 			lo, stLo = kzg_bls12_381.OnDeviceCommit(cp, baseLo)
