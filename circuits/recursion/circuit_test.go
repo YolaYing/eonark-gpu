@@ -209,9 +209,17 @@ func Test_Recursion(t *testing.T) {
 	}
 
 	// 5) Outer circuit: placeholder + assignment
+	inner := &innerCircuit{}
+	innerCS, err := frontend.Compile(ecc.BLS12_381.ScalarField(), scs.NewBuilder, inner)
+	if err != nil {
+		panic(err)
+	}
+
 	outer := &outerCircuitBLS{
-		Proof:        PlaceholderProof[sw_bls12381.ScalarField, sw_bls12381.G1Affine, sw_bls12381.G2Affine](pk.ToGnarkConstraintSystem()),
-		InnerWitness: PlaceholderWitness[sw_bls12381.ScalarField](pk.ToGnarkConstraintSystem()),
+		// Proof:        PlaceholderProof[sw_bls12381.ScalarField, sw_bls12381.G1Affine, sw_bls12381.G2Affine](pk.ToGnarkConstraintSystem()),
+		// InnerWitness: PlaceholderWitness[sw_bls12381.ScalarField](pk.ToGnarkConstraintSystem()),
+		Proof:        PlaceholderProof[sw_bls12381.ScalarField, sw_bls12381.G1Affine, sw_bls12381.G2Affine](innerCS),
+		InnerWitness: PlaceholderWitness[sw_bls12381.ScalarField](innerCS),
 		VerifyingKey: circuitVk, // non-public, injected via option
 		FS:           fsIn,      // non-public, injected via option
 	}
