@@ -123,27 +123,19 @@ func CosetGenToIcicle(g fr.Element) (out [fr.Limbs * 2]uint32) {
 	return
 }
 
-// INttOnDevice: 逆NTT（就地 in-place）。如果 isCoset=true 则按 coset 做 INTT。
-// 约定：输入/输出都在 Montgomery 表示（icicle 的 NTT 接口期望如此）。
-func INttOnDevice(aDev icicle_core.DeviceSlice, isCoset bool, cosetGen [fr.Limbs * 2]uint32) icicle_runtime.EIcicleError {
+func INttOnDevice(aDev icicle_core.DeviceSlice) icicle_runtime.EIcicleError {
 	cfg := icicle_ntt.GetDefaultNttConfig()
-	// KNR = 输出在 Regular 顺序，便于后续与普通系数/点值形式衔接
-	cfg.Ordering = icicle_core.KNR
-	if isCoset {
-		cfg.CosetGen = cosetGen
-	}
+	cfg.Ordering = icicle_core.KNN
 	return icicle_ntt.Ntt(aDev, icicle_core.KInverse, &cfg, aDev)
 }
 
 // NttOnDevice: 正向NTT（就地 in-place）。如果 isCoset=true 则做 coset-NTT。
 // 约定：输入/输出都在 Montgomery 表示。
-func NttOnDevice(aDev icicle_core.DeviceSlice, isCoset bool, cosetGen [fr.Limbs * 2]uint32) icicle_runtime.EIcicleError {
+func NttOnDevice(aDev icicle_core.DeviceSlice) icicle_runtime.EIcicleError {
+
 	cfg := icicle_ntt.GetDefaultNttConfig()
 	// KMN = 常用的正向排列（匹配 gnark/icicle 的用法）
-	cfg.Ordering = icicle_core.KMN
-	if isCoset {
-		cfg.CosetGen = cosetGen
-	}
+	cfg.Ordering = icicle_core.KNN
 	return icicle_ntt.Ntt(aDev, icicle_core.KForward, &cfg, aDev)
 }
 
@@ -151,6 +143,7 @@ func NttOnDevice(aDev icicle_core.DeviceSlice, isCoset bool, cosetGen [fr.Limbs 
 // 注意：icicle 的 vecOps 期望“非 Montgomery”表示；如果你的数据现在是 Montgomery，
 // 请先调用 MontConvOnDevice(s, false) 转出，再做乘法，必要时乘完再转回。
 func VecMulOnDevice(acc, other icicle_core.DeviceSlice) icicle_runtime.EIcicleError {
+
 	vecCfg := icicle_core.DefaultVecOpsConfig()
 	return icicle_vecops.VecOp(acc, other, acc, vecCfg, icicle_core.Mul)
 }

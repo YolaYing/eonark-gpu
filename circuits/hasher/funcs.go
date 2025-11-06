@@ -5,7 +5,7 @@ import (
 	"log"
 	"math/big"
 
-	"github.com/eon-protocol/eonark"
+	// "github.com/eon-protocol/eonark"
 
 	bls12381 "github.com/consensys/gnark-crypto/ecc/bls12-381"
 	"github.com/consensys/gnark-crypto/ecc/bls12-381/fr"
@@ -31,26 +31,6 @@ func Sum(val ...fr.Element) fr.Element {
 		ret = Compress(ret, v)
 	}
 	return ret
-}
-
-// Address hashes a verifying key into a single field element using the same
-// composition as the circuit (see comments inline). This matches the
-// circuit-side Hash* functions when the same parameters/seed are used.
-func Address(val eonark.Vk) fr.Element {
-	sz := fr.NewElement(uint64(val.SZ))
-	ci := fr.NewElement(uint64(val.CI))
-	sc := Compress(sz, ci)
-
-	s1 := DigestHash(val.S1)
-	s2 := DigestHash(val.S2)
-	s3 := DigestHash(val.S3)
-	ql := DigestHash(val.QL)
-	qr := DigestHash(val.QR)
-	qm := DigestHash(val.QM)
-	qo := DigestHash(val.QO)
-	qk := DigestHash(val.QK)
-	qcp := DigestHash(val.QC)
-	return Sum(sz, ci, sc, s1, s2, s3, ql, qr, qm, qo, qk, qcp)
 }
 
 // DigestHash commits a KZG digest (X,Y) by splitting X into quotient/remainder
