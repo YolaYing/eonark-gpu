@@ -527,41 +527,117 @@ func (s *instance) computeLagrangeOneOnCoset(cosetExpMinusOne fr.Element, index 
 	return res
 }
 
+// func (s *instance) commitToLRO() error {
+// 	// wait for blinding polynomials to be initialized or context to be done
+// 	select {
+// 	case <-s.ctx.Done():
+// 		return errContextDone
+// 	case <-s.chbp:
+// 	}
+
+// 	// g := new(errgroup.Group)
+
+// 	// g.Go(func() (err error) {
+// 	// 	s.proof.LRO[0], err = s.commitToPolyAndBlinding(s.x[id_L], s.bp[id_Bl])
+// 	// 	return
+// 	// })
+
+// 	// g.Go(func() (err error) {
+// 	// 	s.proof.LRO[1], err = s.commitToPolyAndBlinding(s.x[id_R], s.bp[id_Br])
+// 	// 	return
+// 	// })
+
+// 	// g.Go(func() (err error) {
+// 	// 	s.proof.LRO[2], err = s.commitToPolyAndBlinding(s.x[id_O], s.bp[id_Bo])
+// 	// 	return
+// 	// })
+
+// 	// return g.Wait()
+	
+// 	var err error
+// 	if s.proof.LRO[0], err = s.commitToPolyAndBlinding(s.x[id_L], s.bp[id_Bl]); err != nil {
+// 		return err
+// 	}
+// 	if s.proof.LRO[1], err = s.commitToPolyAndBlinding(s.x[id_R], s.bp[id_Br]); err != nil {
+// 		return err
+// 	}
+// 	if s.proof.LRO[2], err = s.commitToPolyAndBlinding(s.x[id_O], s.bp[id_Bo]); err != nil {
+// 		return err
+// 	}
+// 	return nil
+// }
+
 func (s *instance) commitToLRO() error {
-	// wait for blinding polynomials to be initialized or context to be done
+	// 等 blinding 好
 	select {
 	case <-s.ctx.Done():
 		return errContextDone
 	case <-s.chbp:
 	}
 
-	// g := new(errgroup.Group)
+	// 优先走 GPU batch 路径
+	if HasIcicle && s.pk != nil && s.pk.deviceInfo != nil {
+		coeffL := s.x[id_L].Coefficients()
+		coeffR := s.x[id_R].Coefficients()
+		coeffO := s.x[id_O].Coefficients()
 
-	// g.Go(func() (err error) {
-	// 	s.proof.LRO[0], err = s.commitToPolyAndBlinding(s.x[id_L], s.bp[id_Bl])
-	// 	return
-	// })
+		var (
+			digs []kzg.Digest
+			st   icicle_runtime.EIcicleError
+		)
+		done := make(chan struct{})
 
-	// g.Go(func() (err error) {
-	// 	s.proof.LRO[1], err = s.commitToPolyAndBlinding(s.x[id_R], s.bp[id_Br])
-	// 	return
-	// })
+		start := time.Now()
+		t0 := time.Now()
+		icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+			defer close(done)
+			base := s.pk.deviceInfo.G1Device.G1Lagrange.RangeTo(len(coeffL), false)
+			digs, st = kzg_bls12_381.OnDeviceCommitBatchLRO(
+				[][]fr.Element{coeffL, coeffR, coeffO},
+				base,
+			)
+		})
+		<-done
+		t1 := time.Since(t0)
 
-	// g.Go(func() (err error) {
-	// 	s.proof.LRO[2], err = s.commitToPolyAndBlinding(s.x[id_O], s.bp[id_Bo])
-	// 	return
-	// })
+		if st == icicle_runtime.Success {
+			// 把 batch 出来的三个 digest 先当作“无 blinding 的 commit”
+			cL := curve.G1Affine(digs[0])
+			cR := curve.G1Affine(digs[1])
+			cO := curve.G1Affine(digs[2])
 
-	// return g.Wait()
-	var err error
-	if s.proof.LRO[0], err = s.commitToPolyAndBlinding(s.x[id_L], s.bp[id_Bl]); err != nil {
-		return err
-	}
-	if s.proof.LRO[1], err = s.commitToPolyAndBlinding(s.x[id_R], s.bp[id_Br]); err != nil {
-		return err
-	}
-	if s.proof.LRO[2], err = s.commitToPolyAndBlinding(s.x[id_O], s.bp[id_Bo]); err != nil {
-		return err
+			n := int(s.domain0.Cardinality)
+
+			t2Start := time.Now()
+			// 然后给每个加上 blinding contribution
+			cbL, err := commitBlindingFactorGPUOrCPU(n, s.bp[id_Bl], s.pk)
+			if err != nil {
+				return err
+			}
+			cbR, err := commitBlindingFactorGPUOrCPU(n, s.bp[id_Br], s.pk)
+			if err != nil {
+				return err
+			}
+			cbO, err := commitBlindingFactorGPUOrCPU(n, s.bp[id_Bo], s.pk)
+			if err != nil {
+				return err
+			}
+			t2 := time.Since(t2Start)
+			total := time.Since(start)
+			log.Printf("[TIMING] commitToLRO: total=%v, bigMSM=%v, blinding=%v", total, t1, t2)
+
+			cL.Add(&cL, &cbL)
+			cR.Add(&cR, &cbR)
+			cO.Add(&cO, &cbO)
+
+			s.proof.LRO[0] = cL
+			s.proof.LRO[1] = cR
+			s.proof.LRO[2] = cO
+			return nil
+		}
+
+		// GPU 失败就退回 CPU 串行老逻辑
+		log.Printf("[GPU failed -> CPU] commitToLRO batch: %s", st.AsString())
 	}
 	return nil
 }
