@@ -116,8 +116,7 @@ func OnDeviceCommitBatchLRO(
 	cfg.AreBasesMontgomeryForm = false  // G1Lagrange 是非 Montgomery
 
 	log.Printf("[MSM batch] size=%d, BatchSize=%d, PrecomputeFactor=%d, C=%d, Bitsize=%d",
-        N, cfg.BatchSize, cfg.PrecomputeFactor, cfg.C, cfg.Bitsize)
-
+		N, cfg.BatchSize, cfg.PrecomputeFactor, cfg.C, cfg.Bitsize)
 
 	// 4) 准备结果 HostSlice，长度 = batchSize
 	out := make(icicle_core.HostSlice[icicle_bls12_381.Projective], batchSize)
@@ -200,6 +199,19 @@ func INttOnDevice(aDev icicle_core.DeviceSlice) icicle_runtime.EIcicleError {
 	return icicle_ntt.Ntt(aDev, icicle_core.KInverse, &cfg, aDev)
 }
 
+func INttOnDeviceStream(
+	dev icicle_core.DeviceSlice,
+	stream icicle_runtime.Stream,
+) icicle_runtime.EIcicleError {
+	cfg := icicle_ntt.GetDefaultNttConfig()
+	cfg.StreamHandle = stream
+	cfg.IsAsync = true
+
+	cfg.Ordering = icicle_core.KNN
+
+	return icicle_ntt.Ntt(dev, icicle_core.KInverse, &cfg, dev)
+}
+
 // NttOnDevice: 正向NTT（就地 in-place）。如果 isCoset=true 则做 coset-NTT。
 // 约定：输入/输出都在 Montgomery 表示。
 func NttOnDevice(aDev icicle_core.DeviceSlice) icicle_runtime.EIcicleError {
@@ -208,6 +220,18 @@ func NttOnDevice(aDev icicle_core.DeviceSlice) icicle_runtime.EIcicleError {
 	// KMN = 常用的正向排列（匹配 gnark/icicle 的用法）
 	cfg.Ordering = icicle_core.KNN
 	return icicle_ntt.Ntt(aDev, icicle_core.KForward, &cfg, aDev)
+}
+func NttOnDeviceStream(
+	dev icicle_core.DeviceSlice,
+	stream icicle_runtime.Stream,
+) icicle_runtime.EIcicleError {
+	cfg := icicle_ntt.GetDefaultNttConfig()
+	cfg.StreamHandle = stream
+	cfg.IsAsync = true
+
+	cfg.Ordering = icicle_core.KNN
+
+	return icicle_ntt.Ntt(dev, icicle_core.KForward, &cfg, dev)
 }
 
 // VecMulOnDevice: 逐元素乘法 acc = acc * other（模 p），就地写回 acc。
@@ -219,6 +243,17 @@ func VecMulOnDevice(acc, other icicle_core.DeviceSlice) icicle_runtime.EIcicleEr
 	return icicle_vecops.VecOp(acc, other, acc, vecCfg, icicle_core.Mul)
 }
 
+func VecMulOnDeviceStream(
+	acc, other icicle_core.DeviceSlice,
+	stream icicle_runtime.Stream,
+) icicle_runtime.EIcicleError {
+	cfg := icicle_core.DefaultVecOpsConfig()
+	cfg.StreamHandle = stream
+	cfg.IsAsync = true
+
+	return icicle_vecops.VecOp(acc, other, acc, cfg, icicle_core.Mul)
+}
+
 // MontConvOnDevice: 标量数组的 Montgomery <-> 非Montgomery 转换（就地）
 // into=true  => ToMontgomery
 // into=false => FromMontgomery
@@ -227,4 +262,35 @@ func MontConvOnDevice(s icicle_core.DeviceSlice, into bool) icicle_runtime.EIcic
 		return icicle_bls12_381.ToMontgomery(s)
 	}
 	return icicle_bls12_381.FromMontgomery(s)
+}
+
+func OnDeviceCommitStream(p []fr.Element, G1Device icicle_core.DeviceSlice, stream icicle_runtime.Stream) (kzg.Digest, icicle_runtime.EIcicleError) {
+	// 1) 把标量拷到设备
+	host := icicle_core.HostSliceFromElements(p)
+
+	var scalarsDev icicle_core.DeviceSlice
+	host.CopyToDevice(&scalarsDev, true)
+
+	// 2) 配置 MSM
+	cfg := icicle_msm.GetDefaultMSMConfig()
+	// gnark-crypto 的标量/基点默认在 Montgomery 形式
+	cfg.StreamHandle = stream
+	cfg.AreScalarsMontgomeryForm = true
+	cfg.AreBasesMontgomeryForm = false
+
+	// 3) 运行 MSM（输出 1 个 projective 点）
+	out := make(icicle_core.HostSlice[icicle_bls12_381.Projective], 1)
+	st := icicle_msm.Msm(scalarsDev, G1Device, &cfg, out)
+
+	_ = scalarsDev.Free()
+
+	// 4) 转成 gnark 的 Affine（= kzg.Digest）
+	res := blsProjectiveToGnarkAffine(out[0])
+
+	// 5) 清理设备内存
+	if st != icicle_runtime.Success {
+		return kzg.Digest{}, st
+	}
+
+	return kzg.Digest(res), icicle_runtime.Success
 }

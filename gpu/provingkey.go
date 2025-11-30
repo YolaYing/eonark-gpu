@@ -17,6 +17,9 @@ import (
 
 type deviceInfo struct {
 	Device   icicle_runtime.Device
+	
+	Streams []icicle_runtime.Stream
+
 	G1Device struct {
 		G1         icicle_core.DeviceSlice
 		G1Lagrange icicle_core.DeviceSlice

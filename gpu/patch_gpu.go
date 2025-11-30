@@ -234,6 +234,16 @@ func (pk *ProvingKey) setupDevicePointers(spr *cs.SparseR1CS) error {
 		return copyErr
 	}
 
+	const numStreams = 4
+	pk.deviceInfo.Streams = make([]icicle_runtime.Stream, numStreams)
+	for i := 0; i < numStreams; i++ {
+		st := icicle_runtime.Success
+		pk.deviceInfo.Streams[i], st = icicle_runtime.CreateStream()
+		if st != icicle_runtime.Success {
+			return fmt.Errorf("CreateStream[%d]: %s", i, st.AsString())
+		}
+	}
+
 	return nil
 
 }
@@ -527,120 +537,187 @@ func (s *instance) computeLagrangeOneOnCoset(cosetExpMinusOne fr.Element, index 
 	return res
 }
 
-// func (s *instance) commitToLRO() error {
-// 	// wait for blinding polynomials to be initialized or context to be done
-// 	select {
-// 	case <-s.ctx.Done():
-// 		return errContextDone
-// 	case <-s.chbp:
-// 	}
+func (s *instance) commitToLROParallel() error {
+	// wait for blinding polynomials to be initialized or context to be done
+	select {
+	case <-s.ctx.Done():
+		return errContextDone
+	case <-s.chbp:
+	}
+	tTotalStart := time.Now()
 
-// 	// g := new(errgroup.Group)
-
-// 	// g.Go(func() (err error) {
-// 	// 	s.proof.LRO[0], err = s.commitToPolyAndBlinding(s.x[id_L], s.bp[id_Bl])
-// 	// 	return
-// 	// })
-
-// 	// g.Go(func() (err error) {
-// 	// 	s.proof.LRO[1], err = s.commitToPolyAndBlinding(s.x[id_R], s.bp[id_Br])
-// 	// 	return
-// 	// })
-
-// 	// g.Go(func() (err error) {
-// 	// 	s.proof.LRO[2], err = s.commitToPolyAndBlinding(s.x[id_O], s.bp[id_Bo])
-// 	// 	return
-// 	// })
-
-// 	// return g.Wait()
-	
-// 	var err error
-// 	if s.proof.LRO[0], err = s.commitToPolyAndBlinding(s.x[id_L], s.bp[id_Bl]); err != nil {
-// 		return err
-// 	}
-// 	if s.proof.LRO[1], err = s.commitToPolyAndBlinding(s.x[id_R], s.bp[id_Br]); err != nil {
-// 		return err
-// 	}
-// 	if s.proof.LRO[2], err = s.commitToPolyAndBlinding(s.x[id_O], s.bp[id_Bo]); err != nil {
-// 		return err
-// 	}
-// 	return nil
-// }
+	var err error
+	if s.proof.LRO[0], err = s.commitToPolyAndBlinding(s.x[id_L], s.bp[id_Bl]); err != nil {
+		return err
+	}
+	if s.proof.LRO[1], err = s.commitToPolyAndBlinding(s.x[id_R], s.bp[id_Br]); err != nil {
+		return err
+	}
+	if s.proof.LRO[2], err = s.commitToPolyAndBlinding(s.x[id_O], s.bp[id_Bo]); err != nil {
+		return err
+	}
+	log.Printf("[TIMING] commitToLRO total=%s", time.Since(tTotalStart))
+	return nil
+}
 
 func (s *instance) commitToLRO() error {
-	// 等 blinding 好
+	// 等 blinding 多项式准备好
 	select {
 	case <-s.ctx.Done():
 		return errContextDone
 	case <-s.chbp:
 	}
 
-	// 优先走 GPU batch 路径
+	// --- 打点：整体 LRO commit 时间 ---
+	tTotalStart := time.Now()
+	defer func() {
+		log.Printf("[TIMING] commitToLRO total=%s", time.Since(tTotalStart))
+	}()
+
+	var streamL, streamR, streamO icicle_runtime.Stream
+
 	if HasIcicle && s.pk != nil && s.pk.deviceInfo != nil {
-		coeffL := s.x[id_L].Coefficients()
-		coeffR := s.x[id_R].Coefficients()
-		coeffO := s.x[id_O].Coefficients()
+		var st icicle_runtime.EIcicleError
 
-		var (
-			digs []kzg.Digest
-			st   icicle_runtime.EIcicleError
-		)
-		done := make(chan struct{})
-
-		start := time.Now()
-		t0 := time.Now()
-		icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
-			defer close(done)
-			base := s.pk.deviceInfo.G1Device.G1Lagrange.RangeTo(len(coeffL), false)
-			digs, st = kzg_bls12_381.OnDeviceCommitBatchLRO(
-				[][]fr.Element{coeffL, coeffR, coeffO},
-				base,
-			)
-		})
-		<-done
-		t1 := time.Since(t0)
-
-		if st == icicle_runtime.Success {
-			// 把 batch 出来的三个 digest 先当作“无 blinding 的 commit”
-			cL := curve.G1Affine(digs[0])
-			cR := curve.G1Affine(digs[1])
-			cO := curve.G1Affine(digs[2])
-
-			n := int(s.domain0.Cardinality)
-
-			t2Start := time.Now()
-			// 然后给每个加上 blinding contribution
-			cbL, err := commitBlindingFactorGPUOrCPU(n, s.bp[id_Bl], s.pk)
-			if err != nil {
-				return err
-			}
-			cbR, err := commitBlindingFactorGPUOrCPU(n, s.bp[id_Br], s.pk)
-			if err != nil {
-				return err
-			}
-			cbO, err := commitBlindingFactorGPUOrCPU(n, s.bp[id_Bo], s.pk)
-			if err != nil {
-				return err
-			}
-			t2 := time.Since(t2Start)
-			total := time.Since(start)
-			log.Printf("[TIMING] commitToLRO: total=%v, bigMSM=%v, blinding=%v", total, t1, t2)
-
-			cL.Add(&cL, &cbL)
-			cR.Add(&cR, &cbR)
-			cO.Add(&cO, &cbO)
-
-			s.proof.LRO[0] = cL
-			s.proof.LRO[1] = cR
-			s.proof.LRO[2] = cO
-			return nil
+		streamL, st = icicle_runtime.CreateStream()
+		if st != icicle_runtime.Success {
+			return fmt.Errorf("create streamL: %s", st.AsString())
 		}
+		defer icicle_runtime.DestroyStream(streamL)
 
-		// GPU 失败就退回 CPU 串行老逻辑
-		log.Printf("[GPU failed -> CPU] commitToLRO batch: %s", st.AsString())
+		streamR, st = icicle_runtime.CreateStream()
+		if st != icicle_runtime.Success {
+			return fmt.Errorf("create streamR: %s", st.AsString())
+		}
+		defer icicle_runtime.DestroyStream(streamR)
+
+		streamO, st = icicle_runtime.CreateStream()
+		if st != icicle_runtime.Success {
+			return fmt.Errorf("create streamO: %s", st.AsString())
+		}
+		defer icicle_runtime.DestroyStream(streamO)
 	}
+
+	// 使用 errgroup 并行执行 3 个 commit
+	g, _ := errgroup.WithContext(s.ctx)
+
+	// L
+	g.Go(func() error {
+		tStart := time.Now()
+		commit, err := s.commitToPolyAndBlindingStream(s.x[id_L], s.bp[id_Bl], streamL)
+		if err != nil {
+			return fmt.Errorf("commitToPolyAndBlinding L: %w", err)
+		}
+		s.proof.LRO[0] = commit
+		log.Printf("[TIMING] commitToLRO L=%s", time.Since(tStart))
+		return nil
+	})
+
+	// R
+	g.Go(func() error {
+		tStart := time.Now()
+		commit, err := s.commitToPolyAndBlindingStream(s.x[id_R], s.bp[id_Br], streamR)
+		if err != nil {
+			return fmt.Errorf("commitToPolyAndBlinding R: %w", err)
+		}
+		s.proof.LRO[1] = commit
+		log.Printf("[TIMING] commitToLRO R=%s", time.Since(tStart))
+		return nil
+	})
+
+	// O
+	g.Go(func() error {
+		tStart := time.Now()
+		commit, err := s.commitToPolyAndBlindingStream(s.x[id_O], s.bp[id_Bo], streamO)
+		if err != nil {
+			return fmt.Errorf("commitToPolyAndBlinding O: %w", err)
+		}
+		s.proof.LRO[2] = commit
+		log.Printf("[TIMING] commitToLRO O=%s", time.Since(tStart))
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
 	return nil
 }
+
+// func (s *instance) commitToLRO() error {
+// 	// 等 blinding 好
+// 	select {
+// 	case <-s.ctx.Done():
+// 		return errContextDone
+// 	case <-s.chbp:
+// 	}
+
+// 	// 优先走 GPU batch 路径
+// 	if HasIcicle && s.pk != nil && s.pk.deviceInfo != nil {
+// 		coeffL := s.x[id_L].Coefficients()
+// 		coeffR := s.x[id_R].Coefficients()
+// 		coeffO := s.x[id_O].Coefficients()
+
+// 		var (
+// 			digs []kzg.Digest
+// 			st   icicle_runtime.EIcicleError
+// 		)
+// 		done := make(chan struct{})
+
+// 		start := time.Now()
+// 		t0 := time.Now()
+// 		icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+// 			defer close(done)
+// 			base := s.pk.deviceInfo.G1Device.G1Lagrange.RangeTo(len(coeffL), false)
+// 			digs, st = kzg_bls12_381.OnDeviceCommitBatchLRO(
+// 				[][]fr.Element{coeffL, coeffR, coeffO},
+// 				base,
+// 			)
+// 		})
+// 		<-done
+// 		t1 := time.Since(t0)
+
+// 		if st == icicle_runtime.Success {
+// 			// 把 batch 出来的三个 digest 先当作“无 blinding 的 commit”
+// 			cL := curve.G1Affine(digs[0])
+// 			cR := curve.G1Affine(digs[1])
+// 			cO := curve.G1Affine(digs[2])
+
+// 			n := int(s.domain0.Cardinality)
+
+// 			t2Start := time.Now()
+// 			// 然后给每个加上 blinding contribution
+// 			cbL, err := commitBlindingFactorGPUOrCPU(n, s.bp[id_Bl], s.pk)
+// 			if err != nil {
+// 				return err
+// 			}
+// 			cbR, err := commitBlindingFactorGPUOrCPU(n, s.bp[id_Br], s.pk)
+// 			if err != nil {
+// 				return err
+// 			}
+// 			cbO, err := commitBlindingFactorGPUOrCPU(n, s.bp[id_Bo], s.pk)
+// 			if err != nil {
+// 				return err
+// 			}
+// 			t2 := time.Since(t2Start)
+// 			total := time.Since(start)
+// 			log.Printf("[TIMING] commitToLRO: total=%v, bigMSM=%v, blinding=%v", total, t1, t2)
+
+// 			cL.Add(&cL, &cbL)
+// 			cR.Add(&cR, &cbR)
+// 			cO.Add(&cO, &cbO)
+
+// 			s.proof.LRO[0] = cL
+// 			s.proof.LRO[1] = cR
+// 			s.proof.LRO[2] = cO
+// 			return nil
+// 		}
+
+// 		// GPU 失败就退回 CPU 串行老逻辑
+// 		log.Printf("[GPU failed -> CPU] commitToLRO batch: %s", st.AsString())
+// 	}
+// 	return nil
+// }
 
 // deriveGammaAndBeta (copy constraint)
 func (s *instance) deriveGammaAndBeta() error {
@@ -696,36 +773,6 @@ func (s *instance) deriveGammaAndBeta() error {
 // /!\ The polynomial p is supposed to be in Lagrange form.
 func (s *instance) commitToPolyAndBlinding(p, b *iop.Polynomial) (commit curve.G1Affine, err error) {
 
-	// if HasIcicle && s.pk != nil && s.pk.deviceInfo != nil {
-	// 	var dig kzg.Digest
-	// 	var st icicle_runtime.EIcicleError
-
-	// 	done := make(chan struct{})
-	// 	icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
-	// 		defer close(done)
-	// 		dig, st = kzg_bls12_381.OnDeviceCommit(p.Coefficients(), s.pk.deviceInfo.G1Device.G1Lagrange)
-	// 	})
-	// 	<-done
-
-	// 	if st == icicle_runtime.Success {
-	// 		log.Printf("[GPU success] kzg.Commit")
-	// 		commit = curve.G1Affine(dig)
-	// 	} else {
-	// 		// GPU 失败 → CPU 回退
-	// 		log.Printf("[GPU failed -> CPU] kzg.Commit")
-	// 		commit, err = kzg.Commit(p.Coefficients(), s.pk.KzgLagrange)
-	// 		if err != nil {
-	// 			return curve.G1Affine{}, err
-	// 		}
-	// 	}
-	// } else {
-	// 	// 无 GPU → 直接 CPU
-	// 	log.Printf("[CPU] kzg.Commit")
-	// 	commit, err = kzg.Commit(p.Coefficients(), s.pk.KzgLagrange)
-	// 	if err != nil {
-	// 		return curve.G1Affine{}, err
-	// 	}
-	// }
 	commit, err = commitOnGPUOrCPU(p.Coefficients(), s.pk, true)
 
 	// commit, err = kzg.Commit(p.Coefficients(), s.pk.KzgLagrange)
@@ -740,6 +787,65 @@ func (s *instance) commitToPolyAndBlinding(p, b *iop.Polynomial) (commit curve.G
 	commit.Add(&commit, &cb)
 
 	return
+}
+
+// commitToPolyAndBlindingStream: 和原版逻辑一致，只是多了一个 stream 参数，
+// 用于 GPU 路径；CPU 路径忽略 stream。
+func (s *instance) commitToPolyAndBlindingStream(
+	p, b *iop.Polynomial,
+	stream icicle_runtime.Stream,
+) (commit curve.G1Affine, err error) {
+
+	coeffs := p.Coefficients()
+
+	// --- 主多项式的 KZG commit ---
+	if HasIcicle && s.pk != nil && s.pk.deviceInfo != nil {
+		// GPU path
+		var dig kzg.Digest
+		var st icicle_runtime.EIcicleError
+
+		// 和老的 commitOnGPUOrCPU 类似，只是换成 OnDeviceCommitStream
+		done := make(chan struct{})
+		icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+			defer close(done)
+			base := s.pk.deviceInfo.G1Device.G1Lagrange.RangeTo(len(coeffs), false)
+			dig, st = kzg_bls12_381.OnDeviceCommitStream(coeffs, base, stream)
+		})
+		<-done
+
+		if st == icicle_runtime.Success {
+			commit = curve.G1Affine(dig)
+		} else {
+			log.Printf("[GPU failed -> CPU] commitToPolyAndBlindingStream main poly: %s", st.AsString())
+			commit, err = kzg.Commit(coeffs, s.pk.KzgLagrange)
+			if err != nil {
+				return curve.G1Affine{}, err
+			}
+		}
+	} else {
+		// CPU path
+		commit, err = kzg.Commit(coeffs, s.pk.KzgLagrange)
+		if err != nil {
+			return curve.G1Affine{}, err
+		}
+	}
+
+	// --- blinding 部分 ---
+	n := int(s.domain0.Cardinality)
+	var cb curve.G1Affine
+
+	if HasIcicle && s.pk != nil && s.pk.deviceInfo != nil {
+		cb, err = commitBlindingFactorGPUOrCPUWithStream(n, b, s.pk, stream)
+		if err != nil {
+			return curve.G1Affine{}, err
+		}
+	} else {
+		cb = commitBlindingFactor(n, b, s.pk.Kzg)
+	}
+
+	commit.Add(&commit, &cb)
+	return commit, nil
+
 }
 
 func (s *instance) deriveAlpha() (err error) {
@@ -1327,20 +1433,39 @@ func (s *instance) computeNumerator() (*iop.Polynomial, error) {
 		// (Ql, Qr, Qm, Qo, S1, S2, S3, Qcp, Qc) and ID, LOne
 		// we could pre-compute these rho*2 FFTs and store them
 		// at the cost of a huge memory footprint.
+		// batchApply(s.x, func(p *iop.Polynomial) {
+		// 	if p == nil {
+		// 		return
+		// 	}
+		// 	// 根据 p.Layout 选择 Regular/BitReverse 的 DeviceSlice；
+		// 	// 同时把 Host 的 Regular/Rev（仅在 CPU 回退时使用）也传入。
+		// 	if useGPU {
+		// 		if idx, ok := poly2idx[p]; ok {
+		// 			_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, &devX[idx])
+		// 			return
+		// 		}
+		// 	}
+		// 	// GPU 不可用或该 poly 未上传 → CPU 回退
+		// 	_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, nil)
+		// })
+
+		// with stream version
+		streams := s.pk.deviceInfo.Streams
+		numStreams := len(streams)
+
 		batchApply(s.x, func(p *iop.Polynomial) {
 			if p == nil {
 				return
 			}
-			// 根据 p.Layout 选择 Regular/BitReverse 的 DeviceSlice；
-			// 同时把 Host 的 Regular/Rev（仅在 CPU 回退时使用）也传入。
 			if useGPU {
 				if idx, ok := poly2idx[p]; ok {
-					_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, &devX[idx])
+					// 根据 idx 做个简单的轮询分配：idx % numStreams
+					stream := streams[idx%numStreams]
+					_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, &devX[idx], stream)
 					return
 				}
 			}
-			// GPU 不可用或该 poly 未上传 → CPU 回退
-			_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, nil)
+			_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, nil, nil)
 		})
 
 		wgBuf.Wait()
@@ -2303,6 +2428,50 @@ func commitBlindingFactorGPUOrCPU(n int, b *iop.Polynomial, pk *ProvingKey) (cur
 	return commitBlindingFactor(n, b, pk.Kzg), nil
 }
 
+// commits to a polynomial of the form b*(Xⁿ-1) where b is of small degree
+// Prefer GPU (icicle v3); fallback to CPU if GPU unavailable or returns error.
+func commitBlindingFactorGPUOrCPUWithStream(n int, b *iop.Polynomial, pk *ProvingKey, stream icicle_runtime.Stream) (curve.G1Affine, error) {
+	cp := b.Coefficients()
+	np := b.Size()
+
+	// --- GPU path ---
+	if HasIcicle && pk != nil && pk.deviceInfo != nil {
+		var (
+			lo, hi     kzg.Digest
+			stLo, stHi icicle_runtime.EIcicleError
+		)
+
+		done := make(chan struct{})
+		icicle_runtime.RunOnDevice(&pk.deviceInfo.Device, func(args ...any) {
+			defer close(done)
+
+			// bases for lo: G1[0:np]
+			baseLo := pk.deviceInfo.G1Device.G1.RangeTo(np, false)
+
+			// bases for hi: G1[n:n+np]
+			baseHi := pk.deviceInfo.G1Device.G1.Range(n, n+np, false)
+
+			lo, stLo = kzg_bls12_381.OnDeviceCommitStream(cp, baseLo, stream)
+			if stLo == icicle_runtime.Success {
+				hi, stHi = kzg_bls12_381.OnDeviceCommitStream(cp, baseHi, stream)
+			}
+		})
+		<-done
+
+		if stLo == icicle_runtime.Success && stHi == icicle_runtime.Success {
+			res := curve.G1Affine(hi)
+			tmp := curve.G1Affine(lo)
+			res.Sub(&res, &tmp)
+			return res, nil
+		}
+
+		log.Printf("[GPU failed -> CPU] commit blinding factor (lo=%s hi=%s)", stLo.AsString(), stHi.AsString())
+	}
+
+	// --- CPU fallback ---
+	return commitBlindingFactor(n, b, pk.Kzg), nil
+}
+
 func OpenOnGPUOrCPU(p []fr.Element, point fr.Element, pk *ProvingKey) (kzg.OpeningProof, error) {
 	// 尝试 GPU
 	if HasIcicle && pk != nil && pk.deviceInfo != nil {
@@ -2329,7 +2498,7 @@ func OpenOnGPUOrCPU(p []fr.Element, point fr.Element, pk *ProvingKey) (kzg.Openi
 
 // 将多项式 p 变换到“当前 coset 上的拉格朗日点值（Regular 布局）”
 // 版本：GPU 端直接使用“已在显存中的缩放向量 wDev”；失败则回退到 CPU。
-func (s *instance) toCosetLagrangeOnGPUorCPU_DEV(
+func (s *instance) toCosetLagrangeOnGPUorCPUOriginal_DEV(
 	p *iop.Polynomial,
 	wDevReg, wDevRev icicle_core.DeviceSlice,
 	sk scalingKind,
@@ -2400,6 +2569,117 @@ func (s *instance) toCosetLagrangeOnGPUorCPU_DEV(
 		}
 		log.Printf("[GPU failed -> CPU] %v", gpuErr)
 	}
+	// ---------------- CPU 回退（保持原有逻辑） ----------------
+	nbTasks := calculateNbTasks(len(s.x)-1) * 2
+	p.ToCanonical(s.domain0, nbTasks)
+
+	// CPU 路径需要 host 侧的缩放表
+	var w []fr.Element
+	switch sk {
+	case scaleCoset:
+		reg, rev := s.pk.deviceInfo.ensureHostCosetTables(s.domain0)
+		if p.Layout == iop.Regular {
+			w = reg
+		} else {
+			w = rev
+		}
+	case scaleBig:
+		reg, rev := s.pk.deviceInfo.ensureHostBigTables(s.domain0.Cardinality)
+		if p.Layout == iop.Regular {
+			w = reg
+		} else {
+			w = rev
+		}
+	default:
+		return fmt.Errorf("unknown scaling kind")
+	}
+
+	cp := p.Coefficients()
+	parallelize(len(cp), func(start, end int) {
+		for j := start; j < end; j++ {
+			cp[j].Mul(&cp[j], &w[j])
+		}
+	}, nbTasks)
+
+	p.ToLagrange(s.domain0, nbTasks).ToRegular()
+	return nil
+}
+
+// 将多项式 p 变换到“当前 coset 上的拉格朗日点值（Regular 布局）”
+// 版本：GPU 端直接使用“已在显存中的缩放向量 wDev”；失败则回退到 CPU。
+func (s *instance) toCosetLagrangeOnGPUorCPU_DEV(
+	p *iop.Polynomial,
+	wDevReg, wDevRev icicle_core.DeviceSlice,
+	sk scalingKind,
+	xdev *icicle_core.DeviceSlice,
+	stream icicle_runtime.Stream,
+) error {
+	if p == nil {
+		return nil
+	}
+
+	selW := wDevReg
+	if p.Layout == iop.BitReverse {
+		selW = wDevRev
+	}
+
+	// ---------- GPU 路径 ----------
+	if HasIcicle && s.pk != nil && s.pk.deviceInfo != nil && xdev != nil {
+		coeffs := p.Coefficients()
+
+		var st icicle_runtime.EIcicleError
+		var gpuErr error
+
+		// s.pk.deviceInfo.mu.Lock() // 串行化设备操作，避免跨 device 的 slice 冲突
+		// defer s.pk.deviceInfo.mu.Unlock()
+
+		done := make(chan struct{})
+		icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+			defer close(done)
+			dev := *xdev
+
+			// 约定：每次调用结束前把 dev 恢复为 Canonical（见尾部 INTT），
+			// 因此这里 dev 一定是 Canonical。
+
+			if st = kzg_bls12_381.MontConvOnDevice(dev, false); st != icicle_runtime.Success {
+				gpuErr = fmt.Errorf("MontConv(dev->nonMont) failed: %s", st.AsString())
+				return
+			}
+			if st = kzg_bls12_381.VecMulOnDeviceStream(dev, selW, stream); st != icicle_runtime.Success {
+				gpuErr = fmt.Errorf("VecMulOnDevice failed: %s", st.AsString())
+				return
+			}
+			if st = kzg_bls12_381.MontConvOnDevice(dev, true); st != icicle_runtime.Success {
+				gpuErr = fmt.Errorf("MontConv(dev->Mont) failed: %s", st.AsString())
+				return
+			}
+
+			// 正变换 NTT：Canonical -> Lagrange(小域)
+			if st = kzg_bls12_381.NttOnDeviceStream(dev, stream); st != icicle_runtime.Success {
+				gpuErr = fmt.Errorf("NttOnDevice failed: %s", st.AsString())
+				return
+			}
+
+			// 4) 回拷 + 释放
+			host := icicle_core.HostSliceFromElements(coeffs)
+			host.CopyFromDevice(&dev)
+
+			// 4) 立刻把 dev 恢复为 Canonical，方便下一个 coset 继续复用
+			if st = kzg_bls12_381.INttOnDeviceStream(dev, stream); st != icicle_runtime.Success {
+				gpuErr = fmt.Errorf("INttOnDevice (restore canonical) failed: %s", st.AsString())
+				return
+			}
+		})
+		<-done
+
+		if gpuErr == nil {
+			// 和原 CPU 逻辑保持一致：本轮后 p 处于 Lagrange Regular
+			*p = *iop.NewPolynomial(&coeffs, iop.Form{Basis: iop.Lagrange, Layout: iop.Regular})
+			return nil
+		}
+		log.Printf("[GPU failed -> CPU] %v", gpuErr)
+	}
+
 	// ---------------- CPU 回退（保持原有逻辑） ----------------
 	nbTasks := calculateNbTasks(len(s.x)-1) * 2
 	p.ToCanonical(s.domain0, nbTasks)
