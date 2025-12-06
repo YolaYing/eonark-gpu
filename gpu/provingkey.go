@@ -40,6 +40,19 @@ type deviceInfo struct {
 	// 供构建 big 表使用的生成元（setup 时记下）
 	bigW fr.Element
 
+	// MSM 预计算相关字段
+	// Lagrange bases 的预计算结果（用于 L/R/O 等多项式的 commit）
+	// 注意：这些字段在 setupDevicePointers 中通过 initMsmPrecomputeLag 初始化
+	G1LagPrecomp  icicle_core.DeviceSlice
+	hasLagPrecomp bool                  // 标记是否已初始化预计算
+	MsmCfgLag     icicle_core.MSMConfig // Lagrange bases 的 MSM 配置
+
+	// Monomial bases 的预计算结果（用于普通 KZG commit）
+	// 注意：这些字段在 setupDevicePointers 中通过 initMsmPrecomputeG1 初始化
+	G1Precomp    icicle_core.DeviceSlice
+	hasG1Precomp bool                  // 标记是否已初始化预计算
+	MsmCfgG1     icicle_core.MSMConfig // Monomial bases 的 MSM 配置
+
 	mu sync.Mutex
 }
 
