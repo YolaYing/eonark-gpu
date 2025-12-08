@@ -43,6 +43,7 @@ import (
 
 	icicle_core "github.com/ingonyama-zk/icicle-gnark/v3/wrappers/golang/core"
 	icicle_bls12_381 "github.com/ingonyama-zk/icicle-gnark/v3/wrappers/golang/curves/bls12381"
+	icicle_msm "github.com/ingonyama-zk/icicle-gnark/v3/wrappers/golang/curves/bls12381/msm"
 	icicle_ntt "github.com/ingonyama-zk/icicle-gnark/v3/wrappers/golang/curves/bls12381/ntt"
 	icicle_runtime "github.com/ingonyama-zk/icicle-gnark/v3/wrappers/golang/runtime"
 )
@@ -232,6 +233,122 @@ func (pk *ProvingKey) setupDevicePointers(spr *cs.SparseR1CS) error {
 	<-done
 	if copyErr != nil {
 		return copyErr
+	}
+
+	/***********************  MSM 预计算初始化  **************************/
+	// 对 Lagrange bases 做预计算（用于 L/R/O 等多项式的 commit）
+	{
+		cfg := icicle_msm.GetDefaultMSMConfig()
+		cfg.AreScalarsMontgomeryForm = true
+		cfg.AreBasesMontgomeryForm = false
+		cfg.ArePointsSharedInBatch = true
+		cfg.IsAsync = false
+
+		// 根据 n 选择 precompute_factor 和 c
+		if n >= 512 {
+			if n >= 8388608 { // n >= 2^23
+				cfg.PrecomputeFactor = 3
+			} else {
+				cfg.PrecomputeFactor = 5
+			}
+		} else {
+			// 小规模 MSM，不使用预计算
+			// 直接使用原始 bases，避免重复存储
+			cfg.PrecomputeFactor = 1
+			cfg.C = 0
+			pk.deviceInfo.MsmCfgLag = cfg
+			pk.deviceInfo.hasLagPrecomp = false // 标记为未预计算，使用原始 bases
+		}
+
+		// 只有大规模 MSM 才进行预计算
+		if n >= 512 {
+			var sample icicle_bls12_381.Affine
+			precomputeSize := n * int(cfg.PrecomputeFactor)
+
+			var precomputeErr icicle_runtime.EIcicleError
+			done = make(chan struct{})
+			icicle_runtime.RunOnDevice(&pk.deviceInfo.Device, func(args ...any) {
+				defer close(done)
+				if _, st := pk.deviceInfo.G1LagPrecomp.Malloc(sample.Size(), precomputeSize); st != icicle_runtime.Success {
+					precomputeErr = st
+					return
+				}
+
+				base := pk.deviceInfo.G1Device.G1Lagrange.RangeTo(n, false)
+				if st := icicle_msm.PrecomputeBases(base, &cfg, pk.deviceInfo.G1LagPrecomp); st != icicle_runtime.Success {
+					precomputeErr = st
+					return
+				}
+			})
+			<-done
+
+			if precomputeErr != icicle_runtime.Success {
+				return fmt.Errorf("MSM precompute Lagrange bases failed: %s", precomputeErr.AsString())
+			}
+
+			pk.deviceInfo.MsmCfgLag = cfg
+			pk.deviceInfo.hasLagPrecomp = true
+		}
+	}
+
+	// 对 Monomial bases 做预计算（用于普通 KZG commit）
+	{
+		cfg := icicle_msm.GetDefaultMSMConfig()
+		cfg.AreScalarsMontgomeryForm = true
+		cfg.AreBasesMontgomeryForm = false
+		cfg.ArePointsSharedInBatch = true
+		cfg.IsAsync = false
+
+		// 根据 n 选择 precompute_factor 和 c
+		if n >= 512 {
+			if n >= 8388608 { // n >= 2^23
+				cfg.PrecomputeFactor = 2
+				cfg.C = 14
+			} else {
+				cfg.PrecomputeFactor = 5
+			}
+		} else {
+			// 小规模 MSM，不使用预计算
+			// 直接使用原始 bases，避免重复存储
+			cfg.PrecomputeFactor = 1
+			cfg.C = 0
+			pk.deviceInfo.MsmCfgG1 = cfg
+			pk.deviceInfo.hasG1Precomp = false // 标记为未预计算，使用原始 bases
+		}
+
+		// 只有大规模 MSM 才进行预计算
+		if n >= 512 {
+			// 预计算 n+3 个点，以覆盖 h1/h2/h3 的最大可能长度（n+2 或 n+3）
+			// 注意：实际预计算大小仍然是 (n+3) * PrecomputeFactor
+			maxPolyLen := n + 3
+			var sample icicle_bls12_381.Affine
+			precomputeSize := maxPolyLen * int(cfg.PrecomputeFactor)
+
+			var precomputeErr icicle_runtime.EIcicleError
+			done = make(chan struct{})
+			icicle_runtime.RunOnDevice(&pk.deviceInfo.Device, func(args ...any) {
+				defer close(done)
+				if _, st := pk.deviceInfo.G1Precomp.Malloc(sample.Size(), precomputeSize); st != icicle_runtime.Success {
+					precomputeErr = st
+					return
+				}
+
+				// 使用前 maxPolyLen 个 bases 进行预计算
+				base := pk.deviceInfo.G1Device.G1.RangeTo(maxPolyLen, false)
+				if st := icicle_msm.PrecomputeBases(base, &cfg, pk.deviceInfo.G1Precomp); st != icicle_runtime.Success {
+					precomputeErr = st
+					return
+				}
+			})
+			<-done
+
+			if precomputeErr != icicle_runtime.Success {
+				return fmt.Errorf("MSM precompute G1 bases failed: %s", precomputeErr.AsString())
+			}
+
+			pk.deviceInfo.MsmCfgG1 = cfg
+			pk.deviceInfo.hasG1Precomp = true
+		}
 	}
 
 	const numStreams = 4
@@ -561,7 +678,7 @@ func (s *instance) commitToLROParallel() error {
 }
 
 func (s *instance) commitToLRO() error {
-	// 等 blinding 多项式准备好
+	// wait for blinding polynomials to be initialized or context to be done
 	select {
 	case <-s.ctx.Done():
 		return errContextDone
@@ -808,8 +925,22 @@ func (s *instance) commitToPolyAndBlindingStream(
 		done := make(chan struct{})
 		icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
 			defer close(done)
-			base := s.pk.deviceInfo.G1Device.G1Lagrange.RangeTo(len(coeffs), false)
-			dig, st = kzg_bls12_381.OnDeviceCommitStream(coeffs, base, stream)
+			N := len(coeffs)
+
+			// 优先使用预计算结果
+			if s.pk.deviceInfo.hasLagPrecomp && N == s.pk.deviceInfo.N {
+				// 使用预计算的 Lagrange bases（长度完全匹配）
+				dig, st = kzg_bls12_381.OnDeviceCommitStreamWithPrecompute(
+					coeffs,
+					s.pk.deviceInfo.G1LagPrecomp,
+					&s.pk.deviceInfo.MsmCfgLag,
+					stream,
+				)
+			} else {
+				// 回退到不使用预计算的版本
+				base := s.pk.deviceInfo.G1Device.G1Lagrange.RangeTo(N, false)
+				dig, st = kzg_bls12_381.OnDeviceCommitStream(coeffs, base, stream)
+			}
 		})
 		<-done
 
@@ -1681,45 +1812,50 @@ func coefficients(p []*iop.Polynomial) [][]fr.Element {
 
 // func commitToQuotient(h1, h2, h3 []fr.Element, proof *plonkbls12381.Proof, kzgPk kzg.ProvingKey) error {
 func commitToQuotient(h1, h2, h3 []fr.Element, proof *plonkbls12381.Proof, pk *ProvingKey) error {
-	// g := new(errgroup.Group)
+	g := new(errgroup.Group)
 
-	// g.Go(func() (err error) {
-	// 	// proof.H[0], err = kzg.Commit(h1, kzgPk)
-	// 	proof.H[0], err = commitOnGPUOrCPU(h1, pk, false /* monomial */)
-	// 	return
-	// })
+	g.Go(func() (err error) {
+		// proof.H[0], err = kzg.Commit(h1, kzgPk)
+		proof.H[0], err = commitOnGPUOrCPU(h1, pk, false /* monomial */)
+		return
+	})
 
-	// g.Go(func() (err error) {
-	// 	// proof.H[1], err = kzg.Commit(h2, kzgPk)
-	// 	proof.H[1], err = commitOnGPUOrCPU(h2, pk, false /* monomial */)
-	// 	return
-	// })
+	g.Go(func() (err error) {
+		// proof.H[1], err = kzg.Commit(h2, kzgPk)
+		proof.H[1], err = commitOnGPUOrCPU(h2, pk, false /* monomial */)
+		return
+	})
 
-	// g.Go(func() (err error) {
-	// 	// proof.H[2], err = kzg.Commit(h3, kzgPk)
-	// 	proof.H[2], err = commitOnGPUOrCPU(h3, pk, false /* monomial */)
-	// 	return
-	// })
+	g.Go(func() (err error) {
+		// proof.H[2], err = kzg.Commit(h3, kzgPk)
+		proof.H[2], err = commitOnGPUOrCPU(h3, pk, false /* monomial */)
+		return
+	})
 
-	// return g.Wait()
-	var err error
-
-	proof.H[0], err = commitOnGPUOrCPU(h1, pk, false /* monomial */)
-	if err != nil {
-		return err
-	}
-
-	proof.H[1], err = commitOnGPUOrCPU(h2, pk, false /* monomial */)
-	if err != nil {
-		return err
-	}
-
-	proof.H[2], err = commitOnGPUOrCPU(h3, pk, false /* monomial */)
-	if err != nil {
+	if err := g.Wait(); err != nil {
 		return err
 	}
 
 	return nil
+
+	// var err error
+
+	// proof.H[0], err = commitOnGPUOrCPU(h1, pk, false /* monomial */)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// proof.H[1], err = commitOnGPUOrCPU(h2, pk, false /* monomial */)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// proof.H[2], err = commitOnGPUOrCPU(h3, pk, false /* monomial */)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// return nil
 
 }
 
@@ -2359,14 +2495,34 @@ func commitOnGPUOrCPU(coeffs []fr.Element, pk *ProvingKey, useLagrange bool) (cu
 		done := make(chan struct{})
 		icicle_runtime.RunOnDevice(&pk.deviceInfo.Device, func(args ...any) {
 			defer close(done)
-			if useLagrange {
-				// dig, st = kzg_bls12_381.OnDeviceCommit(coeffs, pk.deviceInfo.G1Device.G1Lagrange)
-				base := pk.deviceInfo.G1Device.G1Lagrange.RangeTo(len(coeffs), false)
-				dig, st = kzg_bls12_381.OnDeviceCommit(coeffs, base)
+			N := len(coeffs)
+
+			// 优先使用预计算结果
+			if useLagrange && pk.deviceInfo.hasLagPrecomp && N == pk.deviceInfo.N {
+				// 使用预计算的 Lagrange bases（长度完全匹配）
+				dig, st = kzg_bls12_381.OnDeviceCommitWithPrecompute(coeffs, pk.deviceInfo.G1LagPrecomp, &pk.deviceInfo.MsmCfgLag)
+			} else if !useLagrange && pk.deviceInfo.hasG1Precomp {
+				// Monomial bases 预计算了 N+3 个点，可以处理长度 <= N+3 的多项式
+				maxPrecomputedLen := pk.deviceInfo.N + 3
+				if N <= maxPrecomputedLen {
+					// 根据实际长度截取预计算的 bases
+					neededPrecompLen := N * int(pk.deviceInfo.MsmCfgG1.PrecomputeFactor)
+					precompBases := pk.deviceInfo.G1Precomp.RangeTo(neededPrecompLen, false)
+					dig, st = kzg_bls12_381.OnDeviceCommitWithPrecompute(coeffs, precompBases, &pk.deviceInfo.MsmCfgG1)
+				} else {
+					// 长度超出预计算范围，回退到不使用预计算的版本
+					base := pk.deviceInfo.G1Device.G1.RangeTo(N, false)
+					dig, st = kzg_bls12_381.OnDeviceCommit(coeffs, base)
+				}
 			} else {
-				// dig, st = kzg_bls12_381.OnDeviceCommit(coeffs, pk.deviceInfo.G1Device.G1)
-				base := pk.deviceInfo.G1Device.G1.RangeTo(len(coeffs), false)
-				dig, st = kzg_bls12_381.OnDeviceCommit(coeffs, base)
+				// 回退到不使用预计算的版本
+				if useLagrange {
+					base := pk.deviceInfo.G1Device.G1Lagrange.RangeTo(N, false)
+					dig, st = kzg_bls12_381.OnDeviceCommit(coeffs, base)
+				} else {
+					base := pk.deviceInfo.G1Device.G1.RangeTo(N, false)
+					dig, st = kzg_bls12_381.OnDeviceCommit(coeffs, base)
+				}
 			}
 		})
 		<-done
@@ -2385,7 +2541,7 @@ func commitOnGPUOrCPU(coeffs []fr.Element, pk *ProvingKey, useLagrange bool) (cu
 }
 
 // commits to a polynomial of the form b*(Xⁿ-1) where b is of small degree
-// Prefer GPU (icicle v3); fallback to CPU if GPU unavailable or returns error.
+// Prefer GPU (icicle v3) with precomputation; fallback to CPU if GPU unavailable or returns error.
 func commitBlindingFactorGPUOrCPU(n int, b *iop.Polynomial, pk *ProvingKey) (curve.G1Affine, error) {
 	cp := b.Coefficients()
 	np := b.Size()
@@ -2401,15 +2557,51 @@ func commitBlindingFactorGPUOrCPU(n int, b *iop.Polynomial, pk *ProvingKey) (cur
 		icicle_runtime.RunOnDevice(&pk.deviceInfo.Device, func(args ...any) {
 			defer close(done)
 
-			// bases for lo: G1[0:np]
-			baseLo := pk.deviceInfo.G1Device.G1.RangeTo(np, false)
+			// 对于小规模 MSM（np < 512），不使用预计算，直接使用原始 bases
+			// 因为预计算对小规模 MSM 没有性能优势，且配置可能不匹配
+			if pk.deviceInfo.hasG1Precomp && np >= 512 {
+				// 使用预计算的 Monomial bases（仅用于大规模 MSM）
+				cfg := pk.deviceInfo.MsmCfgG1
+				precomputeFactor := int(cfg.PrecomputeFactor)
 
-			// bases for hi: G1[n:n+np]
-			baseHi := pk.deviceInfo.G1Device.G1.Range(n, n+np, false)
+				// bases for lo: G1Precomp[0 : np*PrecomputeFactor]
+				// 预计算了 N+3 个点，所以只要 np <= N+3 就可以使用预计算
+				if np <= pk.deviceInfo.N+3 {
+					neededLoLen := np * precomputeFactor
+					precompLo := pk.deviceInfo.G1Precomp.RangeTo(neededLoLen, false)
+					lo, stLo = kzg_bls12_381.OnDeviceCommitWithPrecompute(cp, precompLo, &cfg)
+				} else {
+					// np 超出预计算范围，回退到不使用预计算
+					baseLo := pk.deviceInfo.G1Device.G1.RangeTo(np, false)
+					lo, stLo = kzg_bls12_381.OnDeviceCommit(cp, baseLo)
+				}
 
-			lo, stLo = kzg_bls12_381.OnDeviceCommit(cp, baseLo)
-			if stLo == icicle_runtime.Success {
-				hi, stHi = kzg_bls12_381.OnDeviceCommit(cp, baseHi)
+				if stLo == icicle_runtime.Success {
+					// bases for hi: G1Precomp[n*PrecomputeFactor : (n+np)*PrecomputeFactor]
+					// 预计算了 N+3 个点，所以只要 n+np <= N+3 就可以使用预计算
+					if n+np <= pk.deviceInfo.N+3 {
+						hiStart := n * precomputeFactor
+						hiEnd := (n + np) * precomputeFactor
+						precompHi := pk.deviceInfo.G1Precomp.Range(hiStart, hiEnd, false)
+						hi, stHi = kzg_bls12_381.OnDeviceCommitWithPrecompute(cp, precompHi, &cfg)
+					} else {
+						// n+np 超出预计算范围，回退到不使用预计算
+						baseHi := pk.deviceInfo.G1Device.G1.Range(n, n+np, false)
+						hi, stHi = kzg_bls12_381.OnDeviceCommit(cp, baseHi)
+					}
+				}
+			} else {
+				// 小规模 MSM 或没有预计算，使用原始 bases
+				// bases for lo: G1[0:np]
+				baseLo := pk.deviceInfo.G1Device.G1.RangeTo(np, false)
+
+				// bases for hi: G1[n:n+np]
+				baseHi := pk.deviceInfo.G1Device.G1.Range(n, n+np, false)
+
+				lo, stLo = kzg_bls12_381.OnDeviceCommit(cp, baseLo)
+				if stLo == icicle_runtime.Success {
+					hi, stHi = kzg_bls12_381.OnDeviceCommit(cp, baseHi)
+				}
 			}
 		})
 		<-done
@@ -2445,15 +2637,51 @@ func commitBlindingFactorGPUOrCPUWithStream(n int, b *iop.Polynomial, pk *Provin
 		icicle_runtime.RunOnDevice(&pk.deviceInfo.Device, func(args ...any) {
 			defer close(done)
 
-			// bases for lo: G1[0:np]
-			baseLo := pk.deviceInfo.G1Device.G1.RangeTo(np, false)
+			// 对于小规模 MSM（np < 512），不使用预计算，直接使用原始 bases
+			// 因为预计算对小规模 MSM 没有性能优势，且配置可能不匹配
+			if pk.deviceInfo.hasG1Precomp && np >= 512 {
+				// 使用预计算的 Monomial bases（仅用于大规模 MSM）
+				cfg := pk.deviceInfo.MsmCfgG1
+				precomputeFactor := int(cfg.PrecomputeFactor)
 
-			// bases for hi: G1[n:n+np]
-			baseHi := pk.deviceInfo.G1Device.G1.Range(n, n+np, false)
+				// bases for lo: G1Precomp[0 : np*PrecomputeFactor]
+				// 预计算了 N+3 个点，所以只要 np <= N+3 就可以使用预计算
+				if np <= pk.deviceInfo.N+3 {
+					neededLoLen := np * precomputeFactor
+					precompLo := pk.deviceInfo.G1Precomp.RangeTo(neededLoLen, false)
+					lo, stLo = kzg_bls12_381.OnDeviceCommitStreamWithPrecompute(cp, precompLo, &cfg, stream)
+				} else {
+					// np 超出预计算范围，回退到不使用预计算
+					baseLo := pk.deviceInfo.G1Device.G1.RangeTo(np, false)
+					lo, stLo = kzg_bls12_381.OnDeviceCommitStream(cp, baseLo, stream)
+				}
 
-			lo, stLo = kzg_bls12_381.OnDeviceCommitStream(cp, baseLo, stream)
-			if stLo == icicle_runtime.Success {
-				hi, stHi = kzg_bls12_381.OnDeviceCommitStream(cp, baseHi, stream)
+				if stLo == icicle_runtime.Success {
+					// bases for hi: G1Precomp[n*PrecomputeFactor : (n+np)*PrecomputeFactor]
+					// 预计算了 N+3 个点，所以只要 n+np <= N+3 就可以使用预计算
+					if n+np <= pk.deviceInfo.N+3 {
+						hiStart := n * precomputeFactor
+						hiEnd := (n + np) * precomputeFactor
+						precompHi := pk.deviceInfo.G1Precomp.Range(hiStart, hiEnd, false)
+						hi, stHi = kzg_bls12_381.OnDeviceCommitStreamWithPrecompute(cp, precompHi, &cfg, stream)
+					} else {
+						// n+np 超出预计算范围，回退到不使用预计算
+						baseHi := pk.deviceInfo.G1Device.G1.Range(n, n+np, false)
+						hi, stHi = kzg_bls12_381.OnDeviceCommitStream(cp, baseHi, stream)
+					}
+				}
+			} else {
+				// 小规模 MSM 或没有预计算，使用原始 bases
+				// bases for lo: G1[0:np]
+				baseLo := pk.deviceInfo.G1Device.G1.RangeTo(np, false)
+
+				// bases for hi: G1[n:n+np]
+				baseHi := pk.deviceInfo.G1Device.G1.Range(n, n+np, false)
+
+				lo, stLo = kzg_bls12_381.OnDeviceCommitStream(cp, baseLo, stream)
+				if stLo == icicle_runtime.Success {
+					hi, stHi = kzg_bls12_381.OnDeviceCommitStream(cp, baseHi, stream)
+				}
 			}
 		})
 		<-done
@@ -2482,7 +2710,22 @@ func OpenOnGPUOrCPU(p []fr.Element, point fr.Element, pk *ProvingKey) (kzg.Openi
 		icicle_runtime.RunOnDevice(&pk.deviceInfo.Device, func(args ...any) {
 			defer close(done)
 			// 传入 monomial SRS（和 Commit 一致）
-			pr, st = kzg_bls12_381.OnDeviceOpen(p, point, pk.deviceInfo.G1Device.G1)
+			// 判断是否使用预计算：需要预计算可用，且 hLen >= 512（与 commitBlindingFactorGPUOrCPUWithStream 保持一致）
+			// 先计算 hLen 来判断
+			hLen := len(p) - 1 // H(X) = (p(X)-p(point)) / (X-point)，长度减1
+			if pk.deviceInfo.hasG1Precomp && hLen >= 512 && hLen <= pk.deviceInfo.N+3 {
+				// 使用预计算的 bases
+				pr, st = kzg_bls12_381.OnDeviceOpenWithPrecompute(
+					p,
+					point,
+					pk.deviceInfo.G1Device.G1,
+					pk.deviceInfo.G1Precomp,
+					&pk.deviceInfo.MsmCfgG1,
+				)
+			} else {
+				// 使用原始 bases（不使用预计算）
+				pr, st = kzg_bls12_381.OnDeviceOpen(p, point, pk.deviceInfo.G1Device.G1)
+			}
 		})
 		<-done
 
