@@ -9,8 +9,6 @@ import (
 	cs "github.com/consensys/gnark/constraint/bls12-381"
 )
 
-// 你已有的 GPU 逻辑在 patch_gpu.go 里定义了 unexported 的 prove(...)
-// 这里导出一个同签名的 Prove 供路由器调用。
 func Prove(spr *cs.SparseR1CS, pk *ProvingKey, w witness.Witness, opts ...backend.ProverOption) (*plonkbls12381.Proof, error) {
 	return prove(spr, pk, w, opts...)
 }

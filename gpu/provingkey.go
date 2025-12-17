@@ -16,8 +16,8 @@ import (
 )
 
 type deviceInfo struct {
-	Device   icicle_runtime.Device
-	
+	Device icicle_runtime.Device
+
 	Streams []icicle_runtime.Stream
 
 	G1Device struct {
@@ -29,34 +29,26 @@ type deviceInfo struct {
 	CosetTable    icicle_core.DeviceSlice // not Montgomery
 	CosetTableRev icicle_core.DeviceSlice // not Montgomery
 
-	// 大域Twiddles，用于scalingVector, 长度为n
 	BigTwiddlesN    icicle_core.DeviceSlice // [1, w_N, w_N^2, ...]
-	BigTwiddlesNRev icicle_core.DeviceSlice // 位反序版
+	BigTwiddlesNRev icicle_core.DeviceSlice
 
-	// —— 仅用于 CPU 回退时的“按需”Host 表（懒加载）
 	onceCoset, onceBig         sync.Once
 	hostCosetReg, hostCosetRev []fr.Element
 	hostBigReg, hostBigRev     []fr.Element
-	// 供构建 big 表使用的生成元（setup 时记下）
+
 	bigW fr.Element
 
-	// MSM 预计算相关字段
-	// Lagrange bases 的预计算结果（用于 L/R/O 等多项式的 commit）
-	// 注意：这些字段在 setupDevicePointers 中通过 initMsmPrecomputeLag 初始化
 	G1LagPrecomp  icicle_core.DeviceSlice
-	hasLagPrecomp bool                  // 标记是否已初始化预计算
-	MsmCfgLag     icicle_core.MSMConfig // Lagrange bases 的 MSM 配置
+	hasLagPrecomp bool
+	MsmCfgLag     icicle_core.MSMConfig
 
-	// Monomial bases 的预计算结果（用于普通 KZG commit）
-	// 注意：这些字段在 setupDevicePointers 中通过 initMsmPrecomputeG1 初始化
 	G1Precomp    icicle_core.DeviceSlice
-	hasG1Precomp bool                  // 标记是否已初始化预计算
-	MsmCfgG1     icicle_core.MSMConfig // Monomial bases 的 MSM 配置
+	hasG1Precomp bool
+	MsmCfgG1     icicle_core.MSMConfig
 
 	mu sync.Mutex
 }
 
-// 同名结构，icicle 版多了 deviceInfo
 type ProvingKey struct {
 	Kzg         kzg.ProvingKey
 	KzgLagrange kzg.ProvingKey
@@ -76,7 +68,7 @@ func WrapProvingKey(pk *plonkbls12381.ProvingKey) (*ProvingKey, error) {
 
 func (di *deviceInfo) ensureHostCosetTables(d0 *fft.Domain) ([]fr.Element, []fr.Element) {
 	di.onceCoset.Do(func() {
-		tab, _ := d0.CosetTable() // [1, s, s^2, ...] ，s = d1.FrMultiplicativeGen 由 gnark 内部管理
+		tab, _ := d0.CosetTable() // [1, s, s^2, ...] ，s = d1.FrMultiplicativeGen
 		di.hostCosetReg = tab
 		di.hostCosetRev = make([]fr.Element, len(tab))
 		copy(di.hostCosetRev, tab)

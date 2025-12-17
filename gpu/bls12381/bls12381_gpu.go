@@ -34,33 +34,27 @@ func blsProjectiveToGnarkAffine(p icicle_bls12_381.Projective) curve.G1Affine {
 	return curve.G1Affine{X: ax, Y: ay}
 }
 
-// OnDeviceCommit 使用已在 GPU 的 G1 (SRS) 做 MSM： [p]·G1
-// p: 多项式系数（假设是 Montgomery 形式；gnark-crypto/fr 默认就是）
-// G1Device: 已在设备端的 G1 bases（例如 pk.deviceInfo.G1Device.G1）
-// 返回：kzg.Digest (= curve.G1Affine)
+// OnDeviceCommit using the G1 bases already on GPU to do MSM: [p]·G1
+// p: polynomial coefficients (assumed to be in Montgomery form; gnark-crypto/fr uses that by default)
+// G1Device: G1 bases already on device (e.g., pk.deviceInfo.G1Device.G1)
+// Returns: kzg.Digest (= curve.G1Affine)
 func OnDeviceCommit(p []fr.Element, G1Device icicle_core.DeviceSlice) (kzg.Digest, icicle_runtime.EIcicleError) {
-	// 1) 把标量拷到设备
 	host := icicle_core.HostSliceFromElements(p)
 
 	var scalarsDev icicle_core.DeviceSlice
 	host.CopyToDevice(&scalarsDev, true)
 	defer scalarsDev.Free()
 
-	// 2) 配置 MSM
 	cfg := icicle_msm.GetDefaultMSMConfig()
-	// gnark-crypto 的标量/基点默认在 Montgomery 形式
 	cfg.AreScalarsMontgomeryForm = true
 	cfg.AreBasesMontgomeryForm = false
 	cfg.PrecomputeFactor = 1 // not using precompute
 
-	// 3) 运行 MSM（输出 1 个 projective 点）
 	out := make(icicle_core.HostSlice[icicle_bls12_381.Projective], 1)
 	st := icicle_msm.Msm(scalarsDev, G1Device, &cfg, out)
 
-	// 4) 转成 gnark 的 Affine（= kzg.Digest）
 	res := blsProjectiveToGnarkAffine(out[0])
 
-	// 5) 清理设备内存
 	if st != icicle_runtime.Success {
 		return kzg.Digest{}, st
 	}
@@ -68,12 +62,8 @@ func OnDeviceCommit(p []fr.Element, G1Device icicle_core.DeviceSlice) (kzg.Diges
 	return kzg.Digest(res), icicle_runtime.Success
 }
 
-// OnDeviceCommitBatchLRO 在 GPU 上对多条多项式（同一套 G1Lagrange 基点）做 batch MSM。
-// 典型用法：一次性对 L/R/O 三个多项式做 KZG commit。
-// 要求：
-//   - polys 长度 = batchSize（例如 3）
-//   - 每个 polys[i] 都是长度相同的 []fr.Element（例如 N = domain0.Cardinality）
-//   - G1Lagrange 是长度 >= N 的 DeviceSlice（例如 pk.deviceInfo.G1Device.G1Lagrange.RangeTo(N, false)）
+// OnDeviceCommitBatchLRO is used for batch MSM on GPU for multiple polynomials sharing the same G1Lagrange bases.
+// Typical use case: commit L/R/O polynomials at once.
 func OnDeviceCommitBatchLRO(
 	polys [][]fr.Element,
 	G1Lagrange icicle_core.DeviceSlice,
@@ -84,51 +74,41 @@ func OnDeviceCommitBatchLRO(
 		return nil, icicle_runtime.Success
 	}
 
-	// 确认所有多项式长度一致
 	N := len(polys[0])
 	for i := 1; i < batchSize; i++ {
 		if len(polys[i]) != N {
-			// EIcicleError 是 int 枚举，不能用 struct literal
-			// 这里直接返回 InvalidArgument + 日志说明原因
 			log.Printf("[OnDeviceCommitBatchLRO] polys have different lengths: N=%d, len(polys[%d])=%d",
 				N, i, len(polys[i]))
 			return nil, icicle_runtime.InvalidArgument
 		}
 	}
 
-	// 1) 把 [L, R, O] flatten 成一个大标量数组：L || R || O
 	flatten := make([]fr.Element, 0, batchSize*N)
 	for i := 0; i < batchSize; i++ {
 		flatten = append(flatten, polys[i]...)
 	}
 
-	// 2) HostSlice → DeviceSlice
+	// HostSlice → DeviceSlice
 	host := icicle_core.HostSliceFromElements(flatten)
 	var scalarsDev icicle_core.DeviceSlice
 	host.CopyToDevice(&scalarsDev, true)
 	defer scalarsDev.Free()
 
-	// 3) MSMConfig：开启 batch + 共享 bases
 	cfg := icicle_msm.GetDefaultMSMConfig()
 	cfg.BatchSize = int32(batchSize)
 	cfg.ArePointsSharedInBatch = true
-	cfg.AreScalarsMontgomeryForm = true // 跟你现有 OnDeviceCommit 保持一致
-	cfg.AreBasesMontgomeryForm = false  // G1Lagrange 是非 Montgomery
+	cfg.AreScalarsMontgomeryForm = true
+	cfg.AreBasesMontgomeryForm = false
 	cfg.PrecomputeFactor = 1
 
-	log.Printf("[MSM batch] size=%d, BatchSize=%d, PrecomputeFactor=%d, C=%d, Bitsize=%d",
-		N, cfg.BatchSize, cfg.PrecomputeFactor, cfg.C, cfg.Bitsize)
-
-	// 4) 准备结果 HostSlice，长度 = batchSize
 	out := make(icicle_core.HostSlice[icicle_bls12_381.Projective], batchSize)
 
-	// 5) 调用 MSM：一次性算出 batchSize 个结果
 	st := icicle_msm.Msm(scalarsDev, G1Lagrange, &cfg, out)
 	if st != icicle_runtime.Success {
 		return nil, st
 	}
 
-	// 6) Projective → gnark Affine（= kzg.Digest）
+	// Projective → gnark Affine（= kzg.Digest）
 	res := make([]kzg.Digest, batchSize)
 	for i := 0; i < batchSize; i++ {
 		aff := blsProjectiveToGnarkAffine(out[i])
