@@ -1,6 +1,5 @@
-# Eonark GPU Version
+# Eonark GPU
 
-# Getting Started
 This section describes **every step required to run EONARK-GPU on a fresh machine**
 
 ## 0. Hardware & OS Assumptions
@@ -26,27 +25,25 @@ Pull all Go dependencies (including `icicle-gnark`) into the local module cache:
 go mod tidy
 ```
 
-## 6. Build ICICLE Native Libraries (BLS12-381)
+## 3. Build ICICLE Native Libraries (BLS12-381)
 
 > **Important**  
 > `icicle-gnark` requires building native C++ libraries manually before it can be used by Go.
 
----
-
-### 6.1 Navigate to ICICLE source directory
+### 3.1 Navigate to ICICLE source directory
 
 ```bash
 cd $(go env GOMODCACHE)/github.com/ingonyama-zk/icicle-gnark/v3@*/wrappers/golang
 ```
 
-### 6.2 Build ICICLE for BLS12-381
+### 3.2 Build ICICLE for BLS12-381
 
 ```bash
 chmod +x build.sh
 ./build.sh -curve=bls12_381
 ```
 
-### 6.3 Verify generated libraries
+### 3.3 Verify generated libraries
 
 Frontend libraries (must exist):
 ```bash
@@ -63,13 +60,11 @@ Backend CUDA libraries (must exist):
 └── libicicle_backend_cuda_device.so
 ```
 
-## 7. Environment Variables
+## 4. Environment Variables
 
 You **must** export the following environment variables so that Go + CGO can correctly locate ICICLE and CUDA libraries.
 
----
-
-### 7.1 Recommended `.envrc` (using direnv)
+### 4.1 Recommended `.envrc` (using direnv)
 
 Create a `.envrc` file in the repository root:
 
@@ -92,7 +87,7 @@ Enable the environment:
 direnv allow
 ```
 
-## 8. Build & Run Tests (GPU)
+## 5. Build & Run Tests (GPU)
 Run the recursion circuit test with GPU enabled:
 ```bash
 go test -tags icicle ./circuits/recursion \
