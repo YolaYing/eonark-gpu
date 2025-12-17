@@ -35,7 +35,6 @@ import (
 	fcs "github.com/consensys/gnark/frontend/cs"
 
 	plonkbls12381 "github.com/consensys/gnark/backend/plonk/bls12-381"
-	"github.com/consensys/gnark/logger"
 
 	// eon "github.com/eon-protocol/eonark"
 	kzg_bls12_381 "github.com/eon-protocol/eonark/gpu/bls12381"
@@ -370,17 +369,19 @@ func hostFromFrSlice(v []fr.Element) icicle_core.HostSlice[fr.Element] {
 }
 
 func prove(spr *cs.SparseR1CS, pk *ProvingKey, fullWitness witness.Witness, opts ...backend.ProverOption) (*plonkbls12381.Proof, error) {
-
+	var setupDeviceDur time.Duration
 	if HasIcicle {
+		t0 := time.Now()
 		if err := pk.setupDevicePointers(spr); err != nil {
 			return nil, fmt.Errorf("icicle device setup: %w", err)
 		}
+		setupDeviceDur = time.Since(t0)
 	}
 
-	log := logger.Logger().With().
-		Str("curve", spr.CurveID().String()).
-		Int("nbConstraints", spr.GetNbConstraints()).
-		Str("backend", "plonk").Logger()
+	// log := logger.Logger().With().
+	// 	Str("curve", spr.CurveID().String()).
+	// 	Int("nbConstraints", spr.GetNbConstraints()).
+	// 	Str("backend", "plonk").Logger()
 
 	// parse the options
 	opt, err := backend.NewProverConfig(opts...)
@@ -388,14 +389,18 @@ func prove(spr *cs.SparseR1CS, pk *ProvingKey, fullWitness witness.Witness, opts
 		return nil, fmt.Errorf("get prover options: %w", err)
 	}
 
-	start := time.Now()
+	// start := time.Now()
 
 	// init instance
+	tSetup := time.Now()
 	g, ctx := errgroup.WithContext(context.Background())
 	instance, err := newInstance(ctx, spr, pk, fullWitness, &opt)
 	if err != nil {
 		return nil, fmt.Errorf("new instance: %w", err)
 	}
+	setupInstanceDur := time.Since(tSetup)
+
+	tProve := time.Now()
 
 	// solve constraints
 	g.Go(instance.solveConstraints)
@@ -427,8 +432,9 @@ func prove(spr *cs.SparseR1CS, pk *ProvingKey, fullWitness witness.Witness, opts
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+	proveDur := time.Since(tProve)
 
-	log.Debug().Dur("took", time.Since(start)).Msg("prover done")
+	log.Printf("plonk prover timing: setup_device=%s, setup_instance=%s, prove=%s", setupDeviceDur, setupInstanceDur, proveDur)
 	return instance.proof, nil
 }
 
@@ -661,7 +667,6 @@ func (s *instance) commitToLROParallel() error {
 		return errContextDone
 	case <-s.chbp:
 	}
-	tTotalStart := time.Now()
 
 	var err error
 	if s.proof.LRO[0], err = s.commitToPolyAndBlinding(s.x[id_L], s.bp[id_Bl]); err != nil {
@@ -673,7 +678,7 @@ func (s *instance) commitToLROParallel() error {
 	if s.proof.LRO[2], err = s.commitToPolyAndBlinding(s.x[id_O], s.bp[id_Bo]); err != nil {
 		return err
 	}
-	log.Printf("[TIMING] commitToLRO total=%s", time.Since(tTotalStart))
+
 	return nil
 }
 
@@ -686,10 +691,6 @@ func (s *instance) commitToLRO() error {
 	}
 
 	// --- 打点：整体 LRO commit 时间 ---
-	tTotalStart := time.Now()
-	defer func() {
-		log.Printf("[TIMING] commitToLRO total=%s", time.Since(tTotalStart))
-	}()
 
 	var streamL, streamR, streamO icicle_runtime.Stream
 
@@ -720,37 +721,36 @@ func (s *instance) commitToLRO() error {
 
 	// L
 	g.Go(func() error {
-		tStart := time.Now()
+
 		commit, err := s.commitToPolyAndBlindingStream(s.x[id_L], s.bp[id_Bl], streamL)
 		if err != nil {
 			return fmt.Errorf("commitToPolyAndBlinding L: %w", err)
 		}
 		s.proof.LRO[0] = commit
-		log.Printf("[TIMING] commitToLRO L=%s", time.Since(tStart))
+
 		return nil
 	})
 
 	// R
 	g.Go(func() error {
-		tStart := time.Now()
+
 		commit, err := s.commitToPolyAndBlindingStream(s.x[id_R], s.bp[id_Br], streamR)
 		if err != nil {
 			return fmt.Errorf("commitToPolyAndBlinding R: %w", err)
 		}
 		s.proof.LRO[1] = commit
-		log.Printf("[TIMING] commitToLRO R=%s", time.Since(tStart))
+
 		return nil
 	})
 
 	// O
 	g.Go(func() error {
-		tStart := time.Now()
+
 		commit, err := s.commitToPolyAndBlindingStream(s.x[id_O], s.bp[id_Bo], streamO)
 		if err != nil {
 			return fmt.Errorf("commitToPolyAndBlinding O: %w", err)
 		}
 		s.proof.LRO[2] = commit
-		log.Printf("[TIMING] commitToLRO O=%s", time.Since(tStart))
 		return nil
 	})
 
@@ -1281,14 +1281,405 @@ func (s *instance) batchOpening() error {
 	return err
 }
 
-// // 函数的目标是：在大域上算出num的点值，存在(cres)中，
-// //
-// //	后续：再逐点除Z_H得t的点值
-// //		 再对长度为∣domain1∣=ρn的数组做INTT，得到t的系数形式
-// //		 最后对每n个系数切出{ti}， 再分别KZG commit
-// //
-// // evaluate the full set of constraints, all polynomials in x are back in
-// // canonical regular form at the end
+// 函数的目标是：在大域上算出num的点值，存在(cres)中，
+//
+//	后续：再逐点除Z_H得t的点值
+//		 再对长度为∣domain1∣=ρn的数组做INTT，得到t的系数形式
+//		 最后对每n个系数切出{ti}， 再分别KZG commit
+//
+// evaluate the full set of constraints, all polynomials in x are back in
+// canonical regular form at the end
+func (s *instance) computeNumerator() (*iop.Polynomial, error) {
+	// init vectors that are used multiple times throughout the computation
+
+	// —————————————————————————————————————————————————————————————————————————— 准备小域H的幂表[1,𝜔,𝜔^2,…,𝜔^𝑛−1], 对于每一个coset来说，第i个点小域坐标(块内相位)都是𝜔^i，实际上evaluation的point是 coset_j * 𝜔^i
+	n := s.domain0.Cardinality
+	twiddles0 := make([]fr.Element, n)
+	if n == 1 {
+		// edge case
+		twiddles0[0].SetOne()
+	} else {
+		twiddles, err := s.domain0.Twiddles()
+		if err != nil {
+			return nil, err
+		}
+		copy(twiddles0, twiddles[0])
+		w := twiddles0[1]
+		for i := len(twiddles[0]); i < len(twiddles0); i++ {
+			twiddles0[i].Mul(&twiddles0[i-1], &w)
+		}
+	}
+	// —————————————————————————————————————————————————————————————————————————— 等待 Qk 准备好
+	// wait for chQk to be closed (or ctx.Done())
+	select {
+	case <-s.ctx.Done():
+		return nil, errContextDone
+	case <-s.chQk:
+	}
+
+	// —————————————————————————————————————————————————————————————————————————— 算门约束 gate constraint Ql​L+Qr​R+Qm​LR+Qo​O+Qk​+∑Qci​Qci+1​ 在大域上的evaluation点值，也就是在X_{i,j} = coset_j * 𝜔^i 上的值
+	nbBsbGates := len(s.proof.Bsb22Commitments)
+
+	gateConstraint := func(u ...fr.Element) fr.Element {
+
+		var ic, tmp fr.Element
+
+		ic.Mul(&u[id_Ql], &u[id_L])
+		tmp.Mul(&u[id_Qr], &u[id_R])
+		ic.Add(&ic, &tmp)
+		tmp.Mul(&u[id_Qm], &u[id_L]).Mul(&tmp, &u[id_R])
+		ic.Add(&ic, &tmp)
+		tmp.Mul(&u[id_Qo], &u[id_O])
+		ic.Add(&ic, &tmp).Add(&ic, &u[id_Qk])
+		for i := 0; i < nbBsbGates; i++ {
+			tmp.Mul(&u[id_Qci+2*i], &u[id_Qci+2*i+1])
+			ic.Add(&ic, &tmp)
+		}
+
+		return ic
+	}
+
+	// —————————————————————————————————————————————————————————————————————————— 生成g和g^2, 用于在 PLONK 置换约束里，分母那边是(L+γ+β⋅x)(R+γ+β⋅gx)(O+γ+β⋅g^2x)
+	var cs, css fr.Element
+	cs.Set(&s.domain1.FrMultiplicativeGen)
+	css.Square(&cs)
+
+	// stores the current coset shifter
+	var coset fr.Element
+	coset.SetOne()
+
+	// cosetExponentiatedToNMinusOne stores <coset>^n-1
+	var cosetExponentiatedToNMinusOne, one fr.Element
+	one.SetOne()
+	bn := big.NewInt(int64(n))
+
+	// —————————————————————————————————————————————————————————————————————————— 标准的 Grand Product 约束：(L+γ+βS1​)(R+γ+βS2​)(O+γ+βS3​)Z(ωX)−(L+γ+βX)(R+γ+βgX)(O+γ+βg2X)Z(X)
+	orderingConstraint := func(index int, u ...fr.Element) fr.Element {
+
+		gamma := s.gamma
+
+		// ordering constraint
+		var a, b, c, r, l, id fr.Element
+
+		// evaluation of ID at coset*ωⁱ where i:=index
+		id.Mul(&twiddles0[index], &coset).Mul(&id, &s.beta)
+
+		// 右侧 (分母) 的三项：L + γ + id, R + γ + id*g, O + γ + id*g^2
+		a.Add(&gamma, &u[id_L]).Add(&a, &id)
+		b.Mul(&id, &cs).Add(&b, &u[id_R]).Add(&b, &gamma)
+		c.Mul(&id, &css).Add(&c, &u[id_O]).Add(&c, &gamma)
+		r.Mul(&a, &b).Mul(&r, &c).Mul(&r, &u[id_Z])
+
+		// 左侧 (分子) 的三项：L + γ + βS1, R + γ + βS2, O + γ + βS3
+		a.Add(&u[id_S1], &u[id_L]).Add(&a, &gamma)
+		b.Add(&u[id_S2], &u[id_R]).Add(&b, &gamma)
+		c.Add(&u[id_S3], &u[id_O]).Add(&c, &gamma)
+		l.Mul(&a, &b).Mul(&l, &c).Mul(&l, &u[id_ZS])
+
+		l.Sub(&l, &r)
+
+		return l
+	}
+
+	// —————————————————————————————————————————————————————————————————————————— 算(1−Z(X))⋅L1​(X), 在大域上的evaluation点值，也就是在X_{i,j} = coset_j * 𝜔^i 上的值
+	localConstraint := func(index int, u ...fr.Element) fr.Element {
+		// local constraint
+		var res, lone fr.Element
+		// 这一步给出 L1(X) = 1/n * (X^n - 1)/(X - 1) on coset*ωⁱ
+		lone = s.computeLagrangeOneOnCoset(cosetExponentiatedToNMinusOne, index)
+		res.SetOne()
+		res.Sub(&u[id_Z], &res).Mul(&res, &lone)
+
+		return res
+	}
+
+	// —————————————————————————————————————————————————————————————————————————— 算 行数 = ρ（coset 块），第一个coset偏移量（shifters[0]）为s，之后的步长（shifters[i>=1]）都为w，真实评估点为Xi,j​=(s⋅wi)⋅ωj,j=0,…,n−1,
+	rho := int(s.domain1.Cardinality / n)
+	shifters := make([]fr.Element, rho)
+	// 选一个不在小域 H里的乘法生成元 s，作为首块的 coset 偏移
+	shifters[0].Set(&s.domain1.FrMultiplicativeGen)
+	for i := 1; i < rho; i++ {
+		shifters[i].Set(&s.domain1.Generator)
+	}
+
+	// —————————————————————————————————————————————————————————————————————————— cosetTable本质上是在算一个长度为n的[1,s,s2,…,s^n−1], 用于把系数按幂次乘上 𝑠^𝑘, 然后在domain0做FFT就可以得到在coset s·H上的n个点值
+	// cosetTable, err := s.domain0.CosetTable()
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	// —————————————————————————————————————————————————————————————————————————— cres存整个大域的点值，buf存当前n个点的中间结果
+	// init the result polynomial & buffer
+	cres := make([]fr.Element, s.domain1.Cardinality)
+	buf := make([]fr.Element, n)
+	var wgBuf sync.WaitGroup
+
+	// —————————————————————————————————————————————————————————————————————————— 整合三类约束为“分子”的点值（allConstraints）
+	allConstraints := func(index int, u ...fr.Element) fr.Element {
+
+		// scale S1, S2, S3 by β
+		// ① S1,S2,S3 ← β·S*
+		u[id_S1].Mul(&u[id_S1], &s.beta)
+		u[id_S2].Mul(&u[id_S2], &s.beta)
+		u[id_S3].Mul(&u[id_S3], &s.beta)
+
+		// blind L, R, O, Z, ZS
+		// ② blind: L,R,O,Z,ZS ← + b(ω^index) ；ZS 用 (index+1)%n
+		var y fr.Element
+		y = s.bp[id_Bl].Evaluate(twiddles0[index])
+		u[id_L].Add(&u[id_L], &y)
+		y = s.bp[id_Br].Evaluate(twiddles0[index])
+		u[id_R].Add(&u[id_R], &y)
+		y = s.bp[id_Bo].Evaluate(twiddles0[index])
+		u[id_O].Add(&u[id_O], &y)
+		y = s.bp[id_Bz].Evaluate(twiddles0[index])
+		u[id_Z].Add(&u[id_Z], &y)
+
+		// ZS is shifted by 1; need to get correct twiddle
+		y = s.bp[id_Bz].Evaluate(twiddles0[(index+1)%int(n)])
+		u[id_ZS].Add(&u[id_ZS], &y)
+
+		// ③ a + α b + α^2 c  （写成 ((c*α + b)*α + a) 避免多次 temp）
+		a := gateConstraint(u...)
+		b := orderingConstraint(index, u...)
+		c := localConstraint(index, u...)
+		c.Mul(&c, &s.alpha).Add(&c, &b).Mul(&c, &s.alpha).Add(&c, &a)
+		return c
+	}
+
+	// ———————————————————————————————————————————————————————————————————————————— 准备缩放向量，系数 × 缩放向量 + 长度 n 的 FFT = 在当前 coset 上评值
+
+	// // for the first iteration, the scalingVector is the coset table
+	// scalingVector := cosetTable
+	// scalingVectorRev := make([]fr.Element, len(cosetTable))
+	// copy(scalingVectorRev, cosetTable)
+	// fft.BitReverse(scalingVectorRev)
+
+	// pre-computed to compute the bit reverse index
+	// of the result polynomial
+	m := uint64(s.domain1.Cardinality)
+	mm := uint64(64 - bits.TrailingZeros64(m))
+
+	// ========= 仅在 computeNumerator 内部：把参与的多项式系数上传到 device =========
+	useGPU := HasIcicle && s.pk != nil && s.pk.deviceInfo != nil
+	var devX []icicle_core.DeviceSlice
+	var uploadedIdx []int
+	var poly2idx map[*iop.Polynomial]int
+
+	if useGPU {
+		devX = make([]icicle_core.DeviceSlice, len(s.x))
+		uploadedIdx = make([]int, 0, len(s.x))
+		poly2idx = make(map[*iop.Polynomial]int, len(s.x))
+
+		var upErr error
+		doneUpload := make(chan struct{})
+
+		icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+			defer close(doneUpload)
+			for i := 0; i < len(s.x); i++ {
+				if i == id_ZS || s.x[i] == nil {
+					continue
+				}
+
+				// 上传到同一张卡
+				host := icicle_core.HostSliceFromElements(s.x[i].Coefficients())
+				host.CopyToDevice(&devX[i], true)
+
+				// device 侧统一规范为 Canonical（后续每轮：系数×缩放→NTT）
+				if s.x[i].Basis != iop.Canonical {
+					if st := kzg_bls12_381.INttOnDevice(devX[i]); st != icicle_runtime.Success {
+						upErr = fmt.Errorf("INttOnDevice poly[%d]: %s", i, st.AsString())
+						return
+					}
+				}
+				uploadedIdx = append(uploadedIdx, i)
+				poly2idx[s.x[i]] = i
+			}
+		})
+		<-doneUpload
+		if upErr != nil {
+			// 上传失败 → 放弃 GPU 路径
+			useGPU = false
+			// 清理已分配的 DeviceSlice
+			icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+				for _, idx := range uploadedIdx {
+					devX[idx].Free()
+
+				}
+			})
+		}
+	}
+
+	// ———————————————————————————————————————————————————————————————————————————— 分配两条长度 n 的数组，稍后装 1/(coset⋅ω^j−1)
+	s.precomputedDenominators = make([]fr.Element, s.domain0.Cardinality)
+	bufBatchInvert := make([]fr.Element, s.domain0.Cardinality)
+
+	// ———————————————————————————————————————————————————————————————————————————— 对每一个 coset 块，做以下操作：定 coset → 备 L₁ 分母 → 调整 blind（加常数&相位）→（i=1 起换缩放表）→ 系数×缩放+小 FFT → 逐点评约束 → 写入大域 → 撤常数保相位。
+	for i := 0; i < rho; i++ {
+
+		// 把“当前块”的 coset 变成 s·w^i；同时算出 (s⋅w^i)ⁿ−1
+		coset.Mul(&coset, &shifters[i]) // i=0: s; i=1: s·w; i=2: s·w²; ...
+		cosetExponentiatedToNMinusOne.Exp(coset, bn).
+			Sub(&cosetExponentiatedToNMinusOne, &one)
+
+		// 为本块一次性算好 1/(coset⋅ω^j−1)
+		for j := 0; j < int(s.domain0.Cardinality); j++ {
+			s.precomputedDenominators[j].
+				Mul(&coset, &twiddles0[j]).
+				Sub(&s.precomputedDenominators[j], &one)
+		}
+		batchInvert(s.precomputedDenominators, bufBatchInvert)
+
+		// 调整 blinding 多项式的系数（适配本块）,把每个 blind 多项式的“第 j 项系数”乘上 (coset^n−1)⋅(shifters[i])^j
+		// bl <- bl *( (s*ωⁱ)ⁿ-1 )s
+		for _, q := range s.bp {
+			cq := q.Coefficients()
+			acc := cosetExponentiatedToNMinusOne
+			for j := 0; j < len(cq); j++ {
+				cq[j].Mul(&cq[j], &acc)
+				acc.Mul(&acc, &shifters[i])
+			}
+		}
+		// 从第 2 块开始换缩放向量, 仅在i=1时把缩放向量从“cosetTable(s)”换成“w^j 幂表”
+		// 选本轮缩放向量（Device & Host 各一份；Regular/BitReverse 两个版本）
+		// var wDevRegular, wDevRev icicle_core.DeviceSlice
+		var wDevReg, wDevRev icicle_core.DeviceSlice
+		var sk scalingKind
+		if i == 0 {
+			// 第 0 块：coset 表
+			wDevReg = s.pk.deviceInfo.CosetTable
+			wDevRev = s.pk.deviceInfo.CosetTableRev
+			sk = scaleCoset
+
+		} else {
+			// 其余块：大域 w^j 表
+			wDevReg = s.pk.deviceInfo.BigTwiddlesN
+			wDevRev = s.pk.deviceInfo.BigTwiddlesNRev
+			sk = scaleBig
+		}
+
+		// 把所有参与的多项式转换成“本块 coset 的 n 个点值”
+		// we do **a lot** of FFT here, but on the small domain.
+		// note that for all the polynomials in the proving key
+		// (Ql, Qr, Qm, Qo, S1, S2, S3, Qcp, Qc) and ID, LOne
+		// we could pre-compute these rho*2 FFTs and store them
+		// at the cost of a huge memory footprint.
+		// batchApply(s.x, func(p *iop.Polynomial) {
+		// 	if p == nil {
+		// 		return
+		// 	}
+		// 	// 根据 p.Layout 选择 Regular/BitReverse 的 DeviceSlice；
+		// 	// 同时把 Host 的 Regular/Rev（仅在 CPU 回退时使用）也传入。
+		// 	if useGPU {
+		// 		if idx, ok := poly2idx[p]; ok {
+		// 			_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, &devX[idx])
+		// 			return
+		// 		}
+		// 	}
+		// 	// GPU 不可用或该 poly 未上传 → CPU 回退
+		// 	_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, nil)
+		// })
+
+		// with stream version
+		streams := s.pk.deviceInfo.Streams
+		numStreams := len(streams)
+
+		batchApply(s.x, func(p *iop.Polynomial) {
+			if p == nil {
+				return
+			}
+			if useGPU {
+				if idx, ok := poly2idx[p]; ok {
+					// 根据 idx 做个简单的轮询分配：idx % numStreams
+					stream := streams[idx%numStreams]
+					_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, &devX[idx], stream)
+					return
+				}
+			}
+			_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, nil, nil)
+		})
+
+		wgBuf.Wait()
+
+		// 计算gateConstraint(u) + α·orderingConstraint(index,u) + α²·localConstraint(index,u)，把分子在这 n 个点的值写入 buf[j]
+		if _, err := iop.Evaluate(
+			allConstraints,
+			buf,
+			iop.Form{Basis: iop.Lagrange, Layout: iop.Regular},
+			s.x...,
+		); err != nil {
+			return nil, err
+		}
+		wgBuf.Add(1)
+		go func(i int) {
+			for j := 0; j < int(n); j++ {
+				// we build the polynomial in bit reverse order
+				cres[bits.Reverse64(uint64(rho*j+i))>>mm] = buf[j]
+			}
+			wgBuf.Done()
+		}(i)
+
+		// 把本块开始时为 blind 系数乘过的 (coset^n - 1) 乘回逆元撤掉
+		cosetExponentiatedToNMinusOne.
+			Inverse(&cosetExponentiatedToNMinusOne)
+		// bl <- bl *( (s*ωⁱ)ⁿ-1 )**-1
+		for _, q := range s.bp {
+			cq := q.Coefficients()
+			for j := 0; j < len(cq); j++ {
+				cq[j].Mul(&cq[j], &cosetExponentiatedToNMinusOne)
+			}
+		}
+	}
+
+	// ——————————————————————————————————————————————————————————————————————— 启动异步“全局回滚”：把所有“按幂次相位污染”一次性撤掉
+	// scale everything back
+	// go func() {
+	// 	s.x[id_ZS] = nil
+	// 	s.x[id_Qk] = nil
+
+	// 	var cs fr.Element
+	// 	cs.Set(&shifters[0])
+	// 	for i := 1; i < len(shifters); i++ {
+	// 		cs.Mul(&cs, &shifters[i])
+	// 	}
+	// 	cs.Inverse(&cs)
+
+	// 	batchApply(s.x, func(p *iop.Polynomial) {
+	// 		if p == nil {
+	// 			return
+	// 		}
+	// 		p.ToCanonical(s.domain0, 8).ToRegular()
+	// 		scalePowers(p, cs)
+	// 	})
+
+	// 	for _, q := range s.bp {
+	// 		scalePowers(q, cs)
+	// 	}
+
+	// 	close(s.chRestoreLRO)
+	// }()
+	// —— GPU 优化的“全局回滚”（失败会自动 CPU 回退）
+
+	go s.scaleEverythingBackGPUorCPU(shifters, poly2idx, devX)
+
+	// ——————————————————————————————————————————————————————————————————————— 确保所有块的 buf → cres 写入都完成；然后把 cres 封装成“大域 coset上的点值多项式（位反序布局）”返回。
+	// ensure all the goroutines are done
+	wgBuf.Wait()
+
+	res := iop.NewPolynomial(&cres, iop.Form{Basis: iop.LagrangeCoset, Layout: iop.BitReverse})
+
+	return res, nil
+
+}
+
+// 函数的目标是：在大域上算出num的点值，存在(cres)中，
+//
+//	后续：再逐点除Z_H得t的点值
+//		 再对长度为∣domain1∣=ρn的数组做INTT，得到t的系数形式
+//		 最后对每n个系数切出{ti}， 再分别KZG commit
+//
+// evaluate the full set of constraints, all polynomials in x are back in
+// canonical regular form at the end
 // func (s *instance) computeNumerator() (*iop.Polynomial, error) {
 // 	// init vectors that are used multiple times throughout the computation
 
@@ -1449,71 +1840,98 @@ func (s *instance) batchOpening() error {
 
 // 	// ———————————————————————————————————————————————————————————————————————————— 准备缩放向量，系数 × 缩放向量 + 长度 n 的 FFT = 在当前 coset 上评值
 
-// 	// // for the first iteration, the scalingVector is the coset table
-// 	// scalingVector := cosetTable
-// 	// scalingVectorRev := make([]fr.Element, len(cosetTable))
-// 	// copy(scalingVectorRev, cosetTable)
-// 	// fft.BitReverse(scalingVectorRev)
-
 // 	// pre-computed to compute the bit reverse index
 // 	// of the result polynomial
 // 	m := uint64(s.domain1.Cardinality)
 // 	mm := uint64(64 - bits.TrailingZeros64(m))
 
-// 	// ========= 仅在 computeNumerator 内部：把参与的多项式系数上传到 device =========
+// 	// ========= computeNumerator 内部：把参与的多项式“连续批量”上传到 device =========
+// 	var batchOnGPU bool
+
 // 	useGPU := HasIcicle && s.pk != nil && s.pk.deviceInfo != nil
-// 	var devX []icicle_core.DeviceSlice
-// 	var uploadedIdx []int
-// 	var poly2idx map[*iop.Polynomial]int
+// 	var (
+// 		polyList []*iop.Polynomial
+// 		poly2row map[*iop.Polynomial]int
+// 		idxList  []int                   // s.x 的原始 index，和 polyList 对齐
+// 		devBatch icicle_core.DeviceSlice // [P * n] row-major
+// 		P        int
+// 	)
 
 // 	if useGPU {
-// 		devX = make([]icicle_core.DeviceSlice, len(s.x))
-// 		uploadedIdx = make([]int, 0, len(s.x))
-// 		poly2idx = make(map[*iop.Polynomial]int, len(s.x))
+// 		// 1) 收集 polyList（保留你原来的“跳过 ZS / nil”的语义）
+// 		polyList = make([]*iop.Polynomial, 0, len(s.x))
+// 		idxList = make([]int, 0, len(s.x))
+// 		poly2row = make(map[*iop.Polynomial]int, len(s.x))
+// 		for i := 0; i < len(s.x); i++ {
+// 			if i == id_ZS || s.x[i] == nil {
+// 				continue
+// 			}
+// 			// 为了 batch NTT 统一布局：把 Layout 规范成 Regular（不改 Basis）
+// 			// 这一步仅影响系数顺序，不改变多项式语义；后续 Evaluate 也期望 Regular。
+// 			s.x[i].ToRegular()
+// 			poly2row[s.x[i]] = len(polyList)
+// 			polyList = append(polyList, s.x[i])
+// 			idxList = append(idxList, i)
+// 		}
+// 		P = len(polyList)
+// 		if P == 0 {
+// 			useGPU = false
+// 		}
+// 	}
 
+// 	if useGPU {
 // 		var upErr error
 // 		doneUpload := make(chan struct{})
-
 // 		icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
 // 			defer close(doneUpload)
-// 			for i := 0; i < len(s.x); i++ {
-// 				if i == id_ZS || s.x[i] == nil {
+
+// 			n0 := int(n)
+// 			total := P * n0
+
+// 			// 2) Host flatten：row-major [P][n]
+// 			hostBatch := make([]fr.Element, 0, total)
+// 			for _, p := range polyList {
+// 				hostBatch = append(hostBatch, p.Coefficients()...)
+// 			}
+
+// 			// 3) 一次性拷贝到 device
+// 			host := icicle_core.HostSliceFromElements(hostBatch)
+// 			host.CopyToDevice(&devBatch, true)
+
+// 			// 4) device 侧统一规范为 Canonical（逐行做 INTT；不需要 D2D）
+// 			//    注意：这里与原逻辑一致：如果 basis != Canonical，则对那一行做 INTT。
+// 			for row, p := range polyList {
+// 				if p.Basis == iop.Canonical {
 // 					continue
 // 				}
-
-// 				// 上传到同一张卡
-// 				host := icicle_core.HostSliceFromElements(s.x[i].Coefficients())
-// 				host.CopyToDevice(&devX[i], true)
-
-// 				// device 侧统一规范为 Canonical（后续每轮：系数×缩放→NTT）
-// 				if s.x[i].Basis != iop.Canonical {
-// 					// log.Printf("[GPU] computeNumerator: converting poly[%d] to Canonical on device", i)
-// 					if st := kzg_bls12_381.INttOnDevice(devX[i]); st != icicle_runtime.Success {
-// 						upErr = fmt.Errorf("INttOnDevice poly[%d]: %s", i, st.AsString())
-// 						return
-// 					}
+// 				seg := devBatch.Range(row*n0, (row+1)*n0, false)
+// 				if st := kzg_bls12_381.INttOnDevice(seg); st != icicle_runtime.Success {
+// 					upErr = fmt.Errorf("INttOnDevice row=%d: %s", row, st.AsString())
+// 					return
 // 				}
-// 				uploadedIdx = append(uploadedIdx, i)
-// 				poly2idx[s.x[i]] = i
+// 				// host 侧元数据也同步（后面每轮我们会把它改成 Lagrange）
+// 				p.Form.Basis = iop.Canonical
+// 				p.Form.Layout = iop.Regular
 // 			}
 // 		})
 // 		<-doneUpload
 // 		if upErr != nil {
-// 			// 上传失败 → 放弃 GPU 路径
 // 			useGPU = false
-// 			// 清理已分配的 DeviceSlice
 // 			icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
-// 				for _, idx := range uploadedIdx {
-// 					devX[idx].Free()
-
-// 				}
+// 				devBatch.Free()
 // 			})
+// 		} else {
+// 			batchOnGPU = true
 // 		}
 // 	}
 
 // 	// ———————————————————————————————————————————————————————————————————————————— 分配两条长度 n 的数组，稍后装 1/(coset⋅ω^j−1)
 // 	s.precomputedDenominators = make([]fr.Element, s.domain0.Cardinality)
 // 	bufBatchInvert := make([]fr.Element, s.domain0.Cardinality)
+
+// 	if batchOnGPU && devBatch.IsEmpty() {
+// 		panic("batchOnGPU=true but devBatch is empty")
+// 	}
 
 // 	// ———————————————————————————————————————————————————————————————————————————— 对每一个 coset 块，做以下操作：定 coset → 备 L₁ 分母 → 调整 blind（加常数&相位）→（i=1 起换缩放表）→ 系数×缩放+小 FFT → 逐点评约束 → 写入大域 → 撤常数保相位。
 // 	for i := 0; i < rho; i++ {
@@ -1541,42 +1959,91 @@ func (s *instance) batchOpening() error {
 // 				acc.Mul(&acc, &shifters[i])
 // 			}
 // 		}
-// 		// 从第 2 块开始换缩放向量, 仅在i=1时把缩放向量从“cosetTable(s)”换成“w^j 幂表”
-// 		// 选本轮缩放向量（Device & Host 各一份；Regular/BitReverse 两个版本）
-// 		// var wDevRegular, wDevRev icicle_core.DeviceSlice
-// 		var wDevReg, wDevRev icicle_core.DeviceSlice
-// 		var sk scalingKind
-// 		if i == 0 {
-// 			// 第 0 块：coset 表
-// 			wDevReg = s.pk.deviceInfo.CosetTable
-// 			wDevRev = s.pk.deviceInfo.CosetTableRev
-// 			sk = scaleCoset
 
-// 		} else {
-// 			// 其余块：大域 w^j 表
-// 			wDevReg = s.pk.deviceInfo.BigTwiddlesN
-// 			wDevRev = s.pk.deviceInfo.BigTwiddlesNRev
-// 			sk = scaleBig
-// 		}
+// 		if batchOnGPU {
+// 			streams := s.pk.deviceInfo.Streams
+// 			stream := streams[i%len(streams)]
+// 			n0 := int(n)
 
-// 		// with stream version
-// 		streams := s.pk.deviceInfo.Streams
-// 		numStreams := len(streams)
-
-// 		batchApply(s.x, func(p *iop.Polynomial) {
-// 			if p == nil {
-// 				return
-// 			}
-// 			if useGPU {
-// 				if idx, ok := poly2idx[p]; ok {
-// 					// 根据 idx 做个简单的轮询分配：idx % numStreams
-// 					stream := streams[idx%numStreams]
-// 					_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, &devX[idx], stream)
+// 			// 1) forward coset-NTT：关键 cosetGen = shifters[i]
+// 			var gpuErr error
+// 			done := make(chan struct{})
+// 			icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+// 				defer close(done)
+// 				if st := kzg_bls12_381.NttBatchCosetOnDeviceStream(
+// 					devBatch,
+// 					P,
+// 					shifters[i], // ✅ 必须用 shifters[i]（增量），不是 coset
+// 					stream,
+// 				); st != icicle_runtime.Success {
+// 					gpuErr = fmt.Errorf("batch coset-NTT failed: %s", st.AsString())
 // 					return
 // 				}
+// 			})
+// 			<-done
+// 			if gpuErr != nil {
+// 				log.Printf("[GPU failed -> CPU] %v", gpuErr)
+// 				batchOnGPU = false
+// 			} else {
+// 				// 2) 回拷点值到 host（写回每个 poly 的 coefficients，供 Evaluate 用）
+// 				icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+// 					for row, p := range polyList {
+// 						seg := devBatch.Range(row*n0, (row+1)*n0, false)
+// 						hostP := icicle_core.HostSliceFromElements(p.Coefficients())
+// 						hostP.CopyFromDevice(&seg)
+// 						p.Form.Basis = iop.Lagrange
+// 						p.Form.Layout = iop.Regular
+// 					}
+// 				})
+// 				// 3) inverse INTT：把 devBatch 恢复成 canonical，并完成“污染更新”
+// 				done = make(chan struct{})
+// 				icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+// 					defer close(done)
+// 					if st := kzg_bls12_381.INttBatchOnDeviceStream(devBatch, P, stream); st != icicle_runtime.Success {
+// 						gpuErr = fmt.Errorf("batch INTT failed: %s", st.AsString())
+// 						return
+// 					}
+
+// 					n0 := int(n)
+// 					for row, p := range polyList {
+// 						seg := devBatch.Range(row*n0, (row+1)*n0, false)
+// 						hostP := icicle_core.HostSliceFromElements(p.Coefficients())
+// 						hostP.CopyFromDevice(&seg)
+// 						p.Form.Basis = iop.Canonical
+// 						p.Form.Layout = iop.Regular
+// 					}
+// 				})
+// 				<-done
+// 				if gpuErr != nil {
+// 					log.Printf("[GPU failed -> CPU] %v", gpuErr)
+// 					useGPU = false
+// 				} else {
+// 					// devBatch 此时已是 canonical + 污染后的系数，进入下一轮继续用
+// 					icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+// 						// host 侧 metadata 不强制同步；下一轮 forward 前我们只依赖 devBatch。
+// 						// host 侧 poly 会在每轮回拷后被设置成 Lagrange Regular。
+// 					})
+// 				}
 // 			}
-// 			_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, nil, nil)
-// 		})
+// 		}
+
+// 		if !useGPU {
+// 			// CPU fallback：保持你原本的语义（仍按 sk 选择 host scaling table）
+// 			var sk scalingKind
+// 			if i == 0 {
+// 				sk = scaleCoset
+// 			} else {
+// 				sk = scaleBig
+// 			}
+// 			var empty icicle_core.DeviceSlice
+// 			var zeroStream icicle_runtime.Stream
+// 			batchApply(s.x, func(p *iop.Polynomial) {
+// 				if p == nil {
+// 					return
+// 				}
+// 				_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, empty, empty, sk, nil, zeroStream)
+// 			})
+// 		}
 
 // 		wgBuf.Wait()
 
@@ -1612,34 +2079,8 @@ func (s *instance) batchOpening() error {
 
 // 	// ——————————————————————————————————————————————————————————————————————— 启动异步“全局回滚”：把所有“按幂次相位污染”一次性撤掉
 // 	// scale everything back
-// 	// go func() {
-// 	// 	s.x[id_ZS] = nil
-// 	// 	s.x[id_Qk] = nil
-
-// 	// 	var cs fr.Element
-// 	// 	cs.Set(&shifters[0])
-// 	// 	for i := 1; i < len(shifters); i++ {
-// 	// 		cs.Mul(&cs, &shifters[i])
-// 	// 	}
-// 	// 	cs.Inverse(&cs)
-
-// 	// 	batchApply(s.x, func(p *iop.Polynomial) {
-// 	// 		if p == nil {
-// 	// 			return
-// 	// 		}
-// 	// 		p.ToCanonical(s.domain0, 8).ToRegular()
-// 	// 		scalePowers(p, cs)
-// 	// 	})
-
-// 	// 	for _, q := range s.bp {
-// 	// 		scalePowers(q, cs)
-// 	// 	}
-
-// 	// 	close(s.chRestoreLRO)
-// 	// }()
-// 	// —— GPU 优化的“全局回滚”（失败会自动 CPU 回退）
-
-// 	go s.scaleEverythingBackGPUorCPU(shifters, poly2idx, devX)
+// 	// go s.scaleEverythingBackGPUorCPU(shifters, poly2idx, devX)
+// 	go s.scaleEverythingBackGPUorCPU(shifters, poly2row, []icicle_core.DeviceSlice{devBatch})
 
 // 	// ——————————————————————————————————————————————————————————————————————— 确保所有块的 buf → cres 写入都完成；然后把 cres 封装成“大域 coset上的点值多项式（位反序布局）”返回。
 // 	// ensure all the goroutines are done
@@ -1651,301 +2092,546 @@ func (s *instance) batchOpening() error {
 
 // }
 
-// =================== computeNumerator (batched vecops + NTT 版本) ===================
+// // =================== computeNumerator (batched vecops + NTT 版本) ===================
 
-// 函数的目标是：在大域上算出 num 的点值，存在 (cres) 中，
+// // 函数的目标是：在大域上算出 num 的点值，存在 (cres) 中，
+// //
+// //	后续：再逐点除 Z_H 得 t 的点值，INTT 得系数，再切 3 份 commit 到 H.
+// //
+// // evaluate the full set of constraints, all polynomials in x are back in
+// // canonical regular form at the end
+// func (s *instance) computeNumerator2() (*iop.Polynomial, error) {
+// 	// ---------- 1. 准备小域 H 的 w^j 幂表 twiddles0 ----------
+// 	n := s.domain0.Cardinality
+// 	twiddles0 := make([]fr.Element, n)
+// 	if n == 1 {
+// 		twiddles0[0].SetOne()
+// 	} else {
+// 		twiddles, err := s.domain0.Twiddles()
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		copy(twiddles0, twiddles[0])
+// 		w := twiddles0[1]
+// 		for i := len(twiddles[0]); i < len(twiddles0); i++ {
+// 			twiddles0[i].Mul(&twiddles0[i-1], &w)
+// 		}
+// 	}
+
+// 	// ---------- 2. 等待 Qk 完成 ----------
+// 	select {
+// 	case <-s.ctx.Done():
+// 		return nil, errContextDone
+// 	case <-s.chQk:
+// 	}
+
+// 	nbBsbGates := len(s.proof.Bsb22Commitments)
+
+// 	// ---------- 3. gate / ordering / local / allConstraints 定义 ----------
+// 	gateConstraint := func(u ...fr.Element) fr.Element {
+// 		var ic, tmp fr.Element
+// 		ic.Mul(&u[id_Ql], &u[id_L])
+// 		tmp.Mul(&u[id_Qr], &u[id_R])
+// 		ic.Add(&ic, &tmp)
+// 		tmp.Mul(&u[id_Qm], &u[id_L]).Mul(&tmp, &u[id_R])
+// 		ic.Add(&ic, &tmp)
+// 		tmp.Mul(&u[id_Qo], &u[id_O])
+// 		ic.Add(&ic, &tmp).Add(&ic, &u[id_Qk])
+// 		for i := 0; i < nbBsbGates; i++ {
+// 			tmp.Mul(&u[id_Qci+2*i], &u[id_Qci+2*i+1])
+// 			ic.Add(&ic, &tmp)
+// 		}
+// 		return ic
+// 	}
+
+// 	// cs = g, css = g^2
+// 	var cs, css fr.Element
+// 	cs.Set(&s.domain1.FrMultiplicativeGen)
+// 	css.Square(&cs)
+
+// 	var coset fr.Element
+// 	coset.SetOne()
+
+// 	var cosetExponentiatedToNMinusOne, one fr.Element
+// 	one.SetOne()
+// 	bn := big.NewInt(int64(n))
+
+// 	orderingConstraint := func(index int, u ...fr.Element) fr.Element {
+// 		gamma := s.gamma
+// 		var a, b, c, r, l, id fr.Element
+
+// 		// id = β * coset * ω^index
+// 		id.Mul(&twiddles0[index], &coset).Mul(&id, &s.beta)
+
+// 		a.Add(&gamma, &u[id_L]).Add(&a, &id)
+// 		b.Mul(&id, &cs).Add(&b, &u[id_R]).Add(&b, &gamma)
+// 		c.Mul(&id, &css).Add(&c, &u[id_O]).Add(&c, &gamma)
+// 		r.Mul(&a, &b).Mul(&r, &c).Mul(&r, &u[id_Z])
+
+// 		a.Add(&u[id_S1], &u[id_L]).Add(&a, &gamma)
+// 		b.Add(&u[id_S2], &u[id_R]).Add(&b, &gamma)
+// 		c.Add(&u[id_S3], &u[id_O]).Add(&c, &gamma)
+// 		l.Mul(&a, &b).Mul(&l, &c).Mul(&l, &u[id_ZS])
+
+// 		l.Sub(&l, &r)
+// 		return l
+// 	}
+
+// 	localConstraint := func(index int, u ...fr.Element) fr.Element {
+// 		var res, lone fr.Element
+// 		lone = s.computeLagrangeOneOnCoset(cosetExponentiatedToNMinusOne, index)
+// 		res.SetOne()
+// 		res.Sub(&u[id_Z], &res).Mul(&res, &lone)
+// 		return res
+// 	}
+
+// 	rho := int(s.domain1.Cardinality / n)
+// 	shifters := make([]fr.Element, rho)
+// 	shifters[0].Set(&s.domain1.FrMultiplicativeGen)
+// 	for i := 1; i < rho; i++ {
+// 		shifters[i].Set(&s.domain1.Generator)
+// 	}
+
+// 	// ---------- 不再在这里调用 domain0.CosetTable()，改为使用 pk.deviceInfo.CosetTable / BigTwiddlesN ----------
+
+// 	// ---------- 4. 结果多项式 (x on big coset) ----------
+// 	cres := make([]fr.Element, s.domain1.Cardinality)
+// 	buf := make([]fr.Element, n)
+// 	var wgBuf sync.WaitGroup
+
+// 	// ---------- 5. allConstraints: 每个点的“分子”值 ----------
+// 	allConstraints := func(index int, u ...fr.Element) fr.Element {
+// 		// 1) S1,S2,S3 ← β·S*
+// 		u[id_S1].Mul(&u[id_S1], &s.beta)
+// 		u[id_S2].Mul(&u[id_S2], &s.beta)
+// 		u[id_S3].Mul(&u[id_S3], &s.beta)
+
+// 		// 2) blind L,R,O,Z,ZS
+// 		var y fr.Element
+// 		y = s.bp[id_Bl].Evaluate(twiddles0[index])
+// 		u[id_L].Add(&u[id_L], &y)
+// 		y = s.bp[id_Br].Evaluate(twiddles0[index])
+// 		u[id_R].Add(&u[id_R], &y)
+// 		y = s.bp[id_Bo].Evaluate(twiddles0[index])
+// 		u[id_O].Add(&u[id_O], &y)
+// 		y = s.bp[id_Bz].Evaluate(twiddles0[index])
+// 		u[id_Z].Add(&u[id_Z], &y)
+// 		y = s.bp[id_Bz].Evaluate(twiddles0[(index+1)%int(n)])
+// 		u[id_ZS].Add(&u[id_ZS], &y)
+
+// 		// 3) gate + α ordering + α² local
+// 		a := gateConstraint(u...)
+// 		b := orderingConstraint(index, u...)
+// 		c := localConstraint(index, u...)
+// 		c.Mul(&c, &s.alpha).Add(&c, &b).Mul(&c, &s.alpha).Add(&c, &a)
+// 		return c
+// 	}
+
+// 	// ---------- 6. GPU 预判，构造 batch device buffer ----------
+// 	useGPU := HasIcicle && s.pk != nil && s.pk.deviceInfo != nil
+// 	var (
+// 		devBatch     icicle_core.DeviceSlice // batched [cosetIdx][polyIdx][n]
+// 		hostBatch    []fr.Element            // host 侧对应的 buffer
+// 		polyList     []*iop.Polynomial       // 参与 batch 的多项式列表（除 ZS）
+// 		poly2batchID map[*iop.Polynomial]int
+// 	)
+
+// 	// 准备小域上分母的 precomputedDenominators & bufBatchInvert
+// 	s.precomputedDenominators = make([]fr.Element, s.domain0.Cardinality)
+// 	bufBatchInvert := make([]fr.Element, s.domain0.Cardinality)
+
+// 	// =============== 6.1 收集需要参与 NTT 的多项式（除 ZS）================
+// 	polyList = make([]*iop.Polynomial, 0, len(s.x))
+// 	for i := 0; i < len(s.x); i++ {
+// 		if i == id_ZS {
+// 			continue
+// 		}
+// 		if s.x[i] != nil {
+// 			polyList = append(polyList, s.x[i])
+// 		}
+// 	}
+
+// 	//   P := 多项式个数（poly 维）
+// 	//   R := coset 个数（coset 维）
+// 	//   N0 := 小域大小（point 维）
+// 	P := len(polyList)
+// 	N0 := int(n)
+
+// 	var batchErr error
+// 	if useGPU {
+// 		// 在 GPU 上构建 batched layout：
+// 		// devBatch: [len(polyList) * rho * n] 的一维显存，逻辑上视作 3D。
+// 		poly2batchID = make(map[*iop.Polynomial]int, len(polyList))
+// 		for idx, p := range polyList {
+// 			poly2batchID[p] = idx
+// 		}
+
+// 		batchErr = s.buildNumeratorDeviceBatches(polyList, rho, int(n), &devBatch)
+// 		if batchErr != nil {
+// 			log.Printf("[GPU failed -> CPU] buildNumeratorDeviceBatches: %v", batchErr)
+// 			useGPU = false
+// 		}
+// 	}
+
+// 	// 如果走 GPU 路径，预先为每个 coset 复用一些 buffer
+// 	var (
+// 		cosetScales []fr.Element // 长度 N0，用来存当前 coset 的 [1, coset, coset^2, ...]
+// 		scaleHost   []fr.Element // 长度 P*N0，用来存当前 coset 的 batch scaling 向量
+// 		stream      icicle_runtime.Stream
+// 	)
+// 	if useGPU {
+// 		cosetScales = make([]fr.Element, N0)
+// 		scaleHost = make([]fr.Element, P*N0)
+// 	}
+
+// 	// m, mm 用于 bit-reverse 写入 cres
+// 	m := uint64(s.domain1.Cardinality)
+// 	mm := uint64(64 - bits.TrailingZeros64(m))
+
+// 	// =============== 7. 逐 coset 逻辑，里面不再做 vecops+NTT，而是从 batch 取数据 ===============
+// 	for ci := 0; ci < rho; ci++ {
+
+// 		// 7.1 更新 coset / coset^(n-1)
+// 		coset.Mul(&coset, &shifters[ci])
+// 		cosetExponentiatedToNMinusOne.Exp(coset, bn).Sub(&cosetExponentiatedToNMinusOne, &one)
+
+// 		// 7.2 准备 L1 分母
+// 		for j := 0; j < int(s.domain0.Cardinality); j++ {
+// 			s.precomputedDenominators[j].
+// 				Mul(&coset, &twiddles0[j]).
+// 				Sub(&s.precomputedDenominators[j], &one)
+// 		}
+// 		batchInvert(s.precomputedDenominators, bufBatchInvert)
+
+// 		// 7.3 调整 blinding 多项式系数（相位+常数因子）
+// 		for _, q := range s.bp {
+// 			cq := q.Coefficients()
+// 			acc := cosetExponentiatedToNMinusOne
+// 			for j := 0; j < len(cq); j++ {
+// 				cq[j].Mul(&cq[j], &acc)
+// 				acc.Mul(&acc, &shifters[ci])
+// 			}
+// 		}
+
+// 		// 7.4 本 coset 的 scaling kind & scaling 向量（仅 CPU fallback 用）
+// 		var sk scalingKind
+// 		if ci == 0 {
+// 			sk = scaleCoset
+// 		} else {
+// 			sk = scaleBig
+// 		}
+
+// 		// 7.5 对当前 coset 的所有多项式：从 Canonical → coset Lagrange（Regular）
+// 		gpuOK := useGPU
+// 		if gpuOK {
+// 			// ---- GPU: 使用 batch VecMul + batch NTT，在 GPU 上完成缩放+NTT，
+// 			// 然后把本 coset 的 Lagrange 值拉回 host，更新到 polyList 中 ----
+
+// 			// 当前 coset 在 hostBatch 中的切片范围：
+// 			// layout = [coset][poly][point]
+// 			// 每个 coset 占用 P*N0 个元素
+// 			cosetLen := P * N0
+// 			cosetOffset := ci * cosetLen
+// 			cosetHostSeg := hostBatch[cosetOffset : cosetOffset+cosetLen]
+// 			accBatchDev := devBatch.Slice(cosetOffset, cosetLen)
+
+// 			// 1) 构造当前 coset 的 scaling 向量：
+// 			//    cosetScales[j] = coset^j, j=0..N0-1
+// 			cosetScales[0].SetOne()
+// 			for j := 1; j < N0; j++ {
+// 				cosetScales[j].Mul(&cosetScales[j-1], &coset)
+// 			}
+// 			// TODO：如果和 CPU 版本有细微差异，再根据 toCosetLagrangeOnGPUorCPU_DEV 的内部逻辑微调
+
+// 			// 2) 批量扩展成 [P][N0] 的 scaling 向量，layout 同样是 [poly][point]
+// 			for pIdx := 0; pIdx < P; pIdx++ {
+// 				rowOffset := pIdx * N0
+// 				copy(scaleHost[rowOffset:rowOffset+N0], cosetScales)
+// 			}
+
+// 			// 3) 在 GPU 上为当前 coset 分配两个 DeviceSlice：accBatchDev, scaleBatchDev
+// 			var (
+// 				// accBatchDev   icicle_core.DeviceSlice
+// 				scaleBatchDev icicle_core.DeviceSlice
+// 				st            icicle_runtime.EIcicleError
+// 			)
+
+// 			// // 3.1 上传当前 coset 的系数到 accBatchDev
+// 			// doneAcc := make(chan struct{})
+// 			// icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+// 			// 	defer close(doneAcc)
+// 			// 	hAcc := icicle_core.HostSliceFromElements(cosetHostSeg)
+// 			// 	hAcc.CopyToDevice(&accBatchDev, true)
+// 			// 	st = icicle_runtime.Success
+// 			// })
+// 			// <-doneAcc
+// 			// if st != icicle_runtime.Success {
+// 			// 	log.Printf("[GPU failed -> CPU] copy accBatch to device failed: %s", st.AsString())
+// 			// 	useGPU = false
+// 			// 	gpuOK = false
+// 			// }
+
+// 			// 3.2 上传 scaling batch 到 scaleBatchDev
+// 			if gpuOK {
+// 				doneScale := make(chan struct{})
+// 				icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+// 					defer close(doneScale)
+// 					hScale := icicle_core.HostSliceFromElements(scaleHost)
+// 					hScale.CopyToDevice(&scaleBatchDev, true)
+// 					st = icicle_runtime.Success
+// 				})
+// 				<-doneScale
+// 				if st != icicle_runtime.Success {
+// 					log.Printf("[GPU failed -> CPU] scale batch copy failed: %s", st.AsString())
+// 					useGPU = false
+// 					gpuOK = false
+// 				}
+// 			}
+
+// 			// 4) 在当前 stream 上对这一块做 batch scaling + batch NTT
+// 			if gpuOK {
+// 				if err := s.applyBatchScalingAndNTTOnDevice(
+// 					accBatchDev,
+// 					scaleBatchDev,
+// 					P,      // batchSize = poly 数
+// 					stream, // 当前使用的 stream（零值 = default stream）
+// 				); err != nil {
+// 					log.Printf("[GPU failed -> CPU] applyBatchScalingAndNTTOnDevice: %v", err)
+// 					useGPU = false
+// 					gpuOK = false
+// 				}
+// 			}
+
+// 			// 5) 把当前 coset 的结果从 device 拷回 hostBatch 对应分段
+// 			if gpuOK {
+// 				doneCopy := make(chan struct{})
+// 				icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+// 					defer close(doneCopy)
+// 					h := icicle_core.HostSliceFromElements(cosetHostSeg)
+// 					// 注意：这里的签名已经变了，见下一节
+// 					h.CopyFromDevice(&accBatchDev)
+// 					st = icicle_runtime.Success
+// 				})
+// 				<-doneCopy
+// 				if st != icicle_runtime.Success {
+// 					log.Printf("[GPU failed -> CPU] CopyFromDevice failed: %s", st.AsString())
+// 					useGPU = false
+// 					gpuOK = false
+// 				}
+// 			}
+
+// 			// 6) 把 host 上当前 coset 的 Lagrange 值回填到 polyList 对应的 Polynomial 中
+// 			if gpuOK {
+// 				for pIdx, p := range polyList {
+// 					row := cosetHostSeg[pIdx*N0 : (pIdx+1)*N0]
+// 					coeffs := p.Coefficients()
+// 					if len(coeffs) != N0 {
+// 						return nil, fmt.Errorf(
+// 							"computeNumerator(gpu): poly %d coeff len=%d != N0=%d",
+// 							pIdx, len(coeffs), N0,
+// 						)
+// 					}
+// 					copy(coeffs, row)
+// 					// 如有必要可以在这里更新 p.Form：
+// 					// p.SetForm(iop.Form{Basis: iop.Lagrange, Layout: iop.Regular})
+// 				}
+// 			}
+// 		}
+
+// 		if !gpuOK {
+// 			// ---- CPU fallback: 使用原来的 per-poly 逻辑 ----
+// 			wDevReg := s.pk.deviceInfo.CosetTable
+// 			wDevRev := s.pk.deviceInfo.CosetTableRev
+// 			if sk == scaleBig {
+// 				wDevReg = s.pk.deviceInfo.BigTwiddlesN
+// 				wDevRev = s.pk.deviceInfo.BigTwiddlesNRev
+// 			}
+
+// 			batchApply(s.x, func(p *iop.Polynomial) {
+// 				if p == nil {
+// 					return
+// 				}
+// 				_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, nil, nil)
+// 			})
+// 		}
+
+// 		// 7.6 用 allConstraints 把该 coset 上的“分子”点值写入 buf
+// 		if _, err := iop.Evaluate(
+// 			allConstraints,
+// 			buf,
+// 			iop.Form{Basis: iop.Lagrange, Layout: iop.Regular},
+// 			s.x...,
+// 		); err != nil {
+// 			return nil, err
+// 		}
+
+// 		// 7.7 把 buf 写入 cres 中该 coset 对应的位置（bit reverse）
+// 		wgBuf.Add(1)
+// 		go func(ci int) {
+// 			for j := 0; j < int(n); j++ {
+// 				cres[bits.Reverse64(uint64(rho*j+ci))>>mm] = buf[j]
+// 			}
+// 			wgBuf.Done()
+// 		}(ci)
+
+// 		// 7.8 撤掉本 coset 对 blinding 系数引入的 (coset^n - 1)
+// 		cosetExponentiatedToNMinusOne.Inverse(&cosetExponentiatedToNMinusOne)
+// 		for _, q := range s.bp {
+// 			cq := q.Coefficients()
+// 			for j := 0; j < len(cq); j++ {
+// 				cq[j].Mul(&cq[j], &cosetExponentiatedToNMinusOne)
+// 			}
+// 		}
+// 	}
+
+// 	// 8. 全局回滚 scale everything back（GPU 优先，内含 CPU fallback）
+// 	go s.scaleEverythingBackGPUorCPU(shifters, nil, nil)
+
+// 	// 9. 等待所有 coset 写入 cres 完成
+// 	wgBuf.Wait()
+
+// 	res := iop.NewPolynomial(&cres, iop.Form{Basis: iop.LagrangeCoset, Layout: iop.BitReverse})
+// 	return res, nil
+// }
+
+// buildNumeratorDeviceBatches 在 GPU 上分配一块 unified device buffer，
+// 用于存放 [cosetIdx][polyIdx][n] 的系数，布局为：
 //
-//	后续：再逐点除 Z_H 得 t 的点值，INTT 得系数，再切 3 份 commit 到 H.
+//	index = cosetIdx * (P * n) + polyIdx * n + j
 //
-// evaluate the full set of constraints, all polynomials in x are back in
-// canonical regular form at the end
-func (s *instance) computeNumerator() (*iop.Polynomial, error) {
-	// ---------- 1. 准备小域 H 的 w^j 幂表 twiddles0 ----------
-	n := s.domain0.Cardinality
-	twiddles0 := make([]fr.Element, n)
-	if n == 1 {
-		twiddles0[0].SetOne()
-	} else {
-		twiddles, err := s.domain0.Twiddles()
-		if err != nil {
-			return nil, err
-		}
-		copy(twiddles0, twiddles[0])
-		w := twiddles0[1]
-		for i := len(twiddles[0]); i < len(twiddles0); i++ {
-			twiddles0[i].Mul(&twiddles0[i-1], &w)
-		}
-	}
+// 初始状态：
+//   - 每个 poly 在每个 coset 上的系数都相同 = Canonical regular form 的系数。
+//   - 即我们为每个 coset 复制了一份 Canonical 系数，后续再在 GPU 上按 coset 做 scaling + NTT。
+// func (s *instance) buildNumeratorDeviceBatches(
+// 	polyList []*iop.Polynomial,
+// 	rho int,
+// 	n int,
+// 	devBatch *icicle_core.DeviceSlice,
+// ) error {
+// 	if len(polyList) == 0 {
+// 		return nil
+// 	}
 
-	// ---------- 2. 等待 Qk 完成 ----------
-	select {
-	case <-s.ctx.Done():
-		return nil, errContextDone
-	case <-s.chQk:
-	}
+// 	P := len(polyList) // poly 个数
+// 	R := rho           // coset 个数
+// 	N0 := n            // 小域大小
 
-	nbBsbGates := len(s.proof.Bsb22Commitments)
+// 	totalSize := P * R * N0
+// 	hostAll := make([]fr.Element, totalSize)
 
-	// ---------- 3. gate / ordering / local / allConstraints 定义 ----------
-	gateConstraint := func(u ...fr.Element) fr.Element {
-		var ic, tmp fr.Element
-		ic.Mul(&u[id_Ql], &u[id_L])
-		tmp.Mul(&u[id_Qr], &u[id_R])
-		ic.Add(&ic, &tmp)
-		tmp.Mul(&u[id_Qm], &u[id_L]).Mul(&tmp, &u[id_R])
-		ic.Add(&ic, &tmp)
-		tmp.Mul(&u[id_Qo], &u[id_O])
-		ic.Add(&ic, &tmp).Add(&ic, &u[id_Qk])
-		for i := 0; i < nbBsbGates; i++ {
-			tmp.Mul(&u[id_Qci+2*i], &u[id_Qci+2*i+1])
-			ic.Add(&ic, &tmp)
-		}
-		return ic
-	}
+// 	// 初始时，每个 coset 上的系数都设置为 poly 的 Canonical 系数。
+// 	// 布局: [coset][poly][point]
+// 	for ci := 0; ci < R; ci++ {
+// 		cosetOffset := ci * P * N0
+// 		for pIdx, p := range polyList {
+// 			coeffs := p.Coefficients()
+// 			if len(coeffs) != N0 {
+// 				return fmt.Errorf("buildNumeratorDeviceBatches: poly %d size=%d != n=%d",
+// 					pIdx, len(coeffs), N0)
+// 			}
+// 			rowOffset := cosetOffset + pIdx*N0
+// 			copy(hostAll[rowOffset:rowOffset+N0], coeffs)
+// 		}
+// 	}
 
-	// cs = g, css = g^2
-	var cs, css fr.Element
-	cs.Set(&s.domain1.FrMultiplicativeGen)
-	css.Square(&cs)
+// 	// 上传到 device
+// 	var st icicle_runtime.EIcicleError
+// 	done := make(chan struct{})
+// 	icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+// 		defer close(done)
+// 		h := icicle_core.HostSliceFromElements(*hostBatch)
+// 		h.CopyToDevice(devBatch, true) // 内部会根据 host 大小分配 devBatch
+// 		st = icicle_runtime.Success
+// 	})
+// 	<-done
 
-	var coset fr.Element
-	coset.SetOne()
+// 	if st != icicle_runtime.Success {
+// 		return fmt.Errorf("buildNumeratorDeviceBatches: device copy failed: %s", st.AsString())
+// 	}
+// 	return nil
+// }
 
-	var cosetExponentiatedToNMinusOne, one fr.Element
-	one.SetOne()
-	bn := big.NewInt(int64(n))
+// applyBatchScalingAndNTTOnDevice 在给定 stream 上：
+// 1. 对 batch 中的每一条向量做逐元素乘法 accBatch *= scaleBatch
+// 2. 对 accBatch 做 batch NTT
+//
+// 约定：
+// - accBatch 和 scaleBatch 都是 [batchSize][vecLen] 按行扁平化后的 DeviceSlice
+// - len(accBatch) == len(scaleBatch) == batchSize * vecLen
+// func (s *instance) applyBatchScalingAndNTTOnDevice(
+// 	accBatch icicle_core.DeviceSlice,
+// 	scaleBatch icicle_core.DeviceSlice,
+// 	batchSize int,
+// 	stream icicle_runtime.Stream,
+// ) error {
 
-	orderingConstraint := func(index int, u ...fr.Element) fr.Element {
-		gamma := s.gamma
-		var a, b, c, r, l, id fr.Element
+// // ---------- (1) 基本 sanity check ----------
+// if batchSize <= 0 {
+// 	return fmt.Errorf("applyBatchScalingAndNTTOnDevice: batchSize must be > 0, got %d", batchSize)
+// }
+// if accBatch.Len() == 0 {
+// 	// 空的直接返回
+// 	return nil
+// }
+// if accBatch.Len() != scaleBatch.Len() {
+// 	return fmt.Errorf(
+// 		"applyBatchScalingAndNTTOnDevice: accBatch.Len()=%d != scaleBatch.Len()=%d",
+// 		accBatch.Len(), scaleBatch.Len(),
+// 	)
+// }
+// if accBatch.Len()%batchSize != 0 {
+// 	return fmt.Errorf(
+// 		"applyBatchScalingAndNTTOnDevice: len %% batchSize != 0 (len=%d, batchSize=%d)",
+// 		accBatch.Len(), batchSize,
+// 	)
+// }
+// vecLen := accBatch.Len() / batchSize
+// if vecLen == 0 {
+// 	return fmt.Errorf("applyBatchScalingAndNTTOnDevice: vecLen computed as 0")
+// }
 
-		// id = β * coset * ω^index
-		id.Mul(&twiddles0[index], &coset).Mul(&id, &s.beta)
+// // （可选）debug 打印
+// log.Printf("[DEBUG] applyBatchScalingAndNTTOnDevice: batchSize=%d, vecLen=%d, totalLen=%d",
+// 	batchSize, vecLen, accBatch.Len())
 
-		a.Add(&gamma, &u[id_L]).Add(&a, &id)
-		b.Mul(&id, &cs).Add(&b, &u[id_R]).Add(&b, &gamma)
-		c.Mul(&id, &css).Add(&c, &u[id_O]).Add(&c, &gamma)
-		r.Mul(&a, &b).Mul(&r, &c).Mul(&r, &u[id_Z])
+// 	// ---------- (2) 真正的 GPU 调用必须放到 RunOnDevice 里 ----------
+// 	var retErr error
 
-		a.Add(&u[id_S1], &u[id_L]).Add(&a, &gamma)
-		b.Add(&u[id_S2], &u[id_R]).Add(&b, &gamma)
-		c.Add(&u[id_S3], &u[id_O]).Add(&c, &gamma)
-		l.Mul(&a, &b).Mul(&l, &c).Mul(&l, &u[id_ZS])
+// 	done := make(chan struct{})
+// 	icicle_runtime.RunOnDevice(&s.pk.deviceInfo.Device, func(args ...any) {
+// 		defer close(done)
 
-		l.Sub(&l, &r)
-		return l
-	}
+// 		// 2.1 batch VecMul: accBatch *= scaleBatch
+// 		if errCode := kzg_bls12_381.VecMulBatchOnDeviceStream(
+// 			accBatch,
+// 			scaleBatch,
+// 			batchSize,
+// 			stream,
+// 		); errCode != 0 {
+// 			retErr = fmt.Errorf("VecMulBatchOnDeviceStream failed with code %d", errCode)
+// 			return
+// 		}
 
-	localConstraint := func(index int, u ...fr.Element) fr.Element {
-		var res, lone fr.Element
-		lone = s.computeLagrangeOneOnCoset(cosetExponentiatedToNMinusOne, index)
-		res.SetOne()
-		res.Sub(&u[id_Z], &res).Mul(&res, &lone)
-		return res
-	}
+// 		// 2.2 batch NTT: accBatch = NTT(accBatch)
+// 		if errCode := kzg_bls12_381.NttBatchOnDeviceStream(
+// 			accBatch,
+// 			batchSize,
+// 			stream,
+// 		); errCode != 0 {
+// 			retErr = fmt.Errorf("NttBatchOnDeviceStream failed with code %d", errCode)
+// 			return
+// 		}
 
-	rho := int(s.domain1.Cardinality / n)
-	shifters := make([]fr.Element, rho)
-	shifters[0].Set(&s.domain1.FrMultiplicativeGen)
-	for i := 1; i < rho; i++ {
-		shifters[i].Set(&s.domain1.Generator)
-	}
+// 		// 2.3 同步当前 stream，确保 NTT 完成
+// 		if syncErr := icicle_runtime.SynchronizeStream(stream); syncErr != 0 {
+// 			retErr = fmt.Errorf("SynchronizeStream(stream) failed with code %d", syncErr)
+// 			return
+// 		}
+// 	})
+// 	<-done
 
-	// ---------- 不再在这里调用 domain0.CosetTable()，改为使用 pk.deviceInfo.CosetTable / BigTwiddlesN ----------
-
-	// ---------- 4. 结果多项式 (x on big coset) ----------
-	cres := make([]fr.Element, s.domain1.Cardinality)
-	buf := make([]fr.Element, n)
-	var wgBuf sync.WaitGroup
-
-	// ---------- 5. allConstraints: 每个点的“分子”值 ----------
-	allConstraints := func(index int, u ...fr.Element) fr.Element {
-		// 1) S1,S2,S3 ← β·S*
-		u[id_S1].Mul(&u[id_S1], &s.beta)
-		u[id_S2].Mul(&u[id_S2], &s.beta)
-		u[id_S3].Mul(&u[id_S3], &s.beta)
-
-		// 2) blind L,R,O,Z,ZS
-		var y fr.Element
-		y = s.bp[id_Bl].Evaluate(twiddles0[index])
-		u[id_L].Add(&u[id_L], &y)
-		y = s.bp[id_Br].Evaluate(twiddles0[index])
-		u[id_R].Add(&u[id_R], &y)
-		y = s.bp[id_Bo].Evaluate(twiddles0[index])
-		u[id_O].Add(&u[id_O], &y)
-		y = s.bp[id_Bz].Evaluate(twiddles0[index])
-		u[id_Z].Add(&u[id_Z], &y)
-		y = s.bp[id_Bz].Evaluate(twiddles0[(index+1)%int(n)])
-		u[id_ZS].Add(&u[id_ZS], &y)
-
-		// 3) gate + α ordering + α² local
-		a := gateConstraint(u...)
-		b := orderingConstraint(index, u...)
-		c := localConstraint(index, u...)
-		c.Mul(&c, &s.alpha).Add(&c, &b).Mul(&c, &s.alpha).Add(&c, &a)
-		return c
-	}
-
-	// ---------- 6. GPU 预判，构造 batch device buffer ----------
-	useGPU := HasIcicle && s.pk != nil && s.pk.deviceInfo != nil
-	var (
-		devBatch     icicle_core.DeviceSlice // batched [polyIdx][cosetIdx][n]
-		hostBatch    []fr.Element            // host mirror (可选，用于回拷)
-		polyList     []*iop.Polynomial       // 参与 batch 的多项式列表（除 ZS）
-		poly2batchID map[*iop.Polynomial]int
-	)
-
-	// 准备小域上分母的 precomputedDenominators & bufBatchInvert
-	s.precomputedDenominators = make([]fr.Element, s.domain0.Cardinality)
-	bufBatchInvert := make([]fr.Element, s.domain0.Cardinality)
-
-	// =============== 6.1 收集需要参与 NTT 的多项式（除 ZS）================
-	polyList = make([]*iop.Polynomial, 0, len(s.x))
-	for i := 0; i < len(s.x); i++ {
-		if i == id_ZS {
-			continue
-		}
-		if s.x[i] != nil {
-			polyList = append(polyList, s.x[i])
-		}
-	}
-
-	var batchErr error
-	if useGPU {
-		// 在 GPU 上构建 batched layout：
-		// devBatch: [len(polyList) * rho * n] 的一维显存，逻辑上视作 3D。
-		poly2batchID = make(map[*iop.Polynomial]int, len(polyList))
-		for idx, p := range polyList {
-			poly2batchID[p] = idx
-		}
-
-		batchErr = s.buildNumeratorDeviceBatches(polyList, rho, int(n), &devBatch, &hostBatch)
-		if batchErr != nil {
-			log.Printf("[GPU failed -> CPU] buildNumeratorDeviceBatches: %v", batchErr)
-			useGPU = false
-		}
-	}
-
-	// m, mm 用于 bit-reverse 写入 cres
-	m := uint64(s.domain1.Cardinality)
-	mm := uint64(64 - bits.TrailingZeros64(m))
-
-	// =============== 7. 逐 coset 逻辑，里面不再做 vecops+NTT，而是从 batch 取数据 ===============
-	for ci := 0; ci < rho; ci++ {
-
-		// 7.1 更新 coset / coset^(n-1)
-		coset.Mul(&coset, &shifters[ci])
-		cosetExponentiatedToNMinusOne.Exp(coset, bn).Sub(&cosetExponentiatedToNMinusOne, &one)
-
-		// 7.2 准备 L1 分母
-		for j := 0; j < int(s.domain0.Cardinality); j++ {
-			s.precomputedDenominators[j].
-				Mul(&coset, &twiddles0[j]).
-				Sub(&s.precomputedDenominators[j], &one)
-		}
-		batchInvert(s.precomputedDenominators, bufBatchInvert)
-
-		// 7.3 调整 blinding 多项式系数（相位+常数因子）
-		for _, q := range s.bp {
-			cq := q.Coefficients()
-			acc := cosetExponentiatedToNMinusOne
-			for j := 0; j < len(cq); j++ {
-				cq[j].Mul(&cq[j], &acc)
-				acc.Mul(&acc, &shifters[ci])
-			}
-		}
-
-		// 7.4 本 coset 的 scaling kind & scaling 向量（仅 CPU fallback 用）
-		var sk scalingKind
-		if ci == 0 {
-			sk = scaleCoset
-		} else {
-			sk = scaleBig
-		}
-
-		// 7.5 对当前 coset 的所有多项式：从 Canonical → coset Lagrange（Regular）
-		if useGPU {
-			// ---- GPU: 使用批处理，在 GPU 上完成缩放+NTT，然后把本 coset 的 Lagrange 值拉回 host ----
-			if err := s.applyBatchScalingAndNTTOnDevice(
-				polyList,
-				poly2batchID,
-				rho,
-				int(n),
-				ci,
-				sk,
-				&devBatch,
-				&hostBatch,
-			); err != nil {
-				log.Printf("[GPU failed -> CPU] applyBatchScalingAndNTTOnDevice: %v", err)
-				useGPU = false
-				// 回退 CPU：立刻补一次 CPU 的缩放 + NTT
-				for _, p := range polyList {
-					_ = s.toCosetLagrangeOnGPUorCPU_DEV(p,
-						s.pk.deviceInfo.CosetTable,
-						s.pk.deviceInfo.CosetTableRev,
-						sk,
-						nil,
-						nil,
-					)
-				}
-			}
-		} else {
-			// ---- CPU fallback: 使用原来的 per-poly 逻辑 ----
-			// 注意：这里沿用 toCosetLagrangeOnGPUorCPU_DEV 的 CPU 路径，
-			//      只需要传 xdev=nil, stream=0 即可自动走 CPU。
-			wDevReg := s.pk.deviceInfo.CosetTable
-			wDevRev := s.pk.deviceInfo.CosetTableRev
-			if sk == scaleBig {
-				wDevReg = s.pk.deviceInfo.BigTwiddlesN
-				wDevRev = s.pk.deviceInfo.BigTwiddlesNRev
-			}
-
-			batchApply(s.x, func(p *iop.Polynomial) {
-				if p == nil {
-					return
-				}
-				_ = s.toCosetLagrangeOnGPUorCPU_DEV(p, wDevReg, wDevRev, sk, nil, nil)
-			})
-		}
-
-		// 7.6 用 allConstraints 把该 coset 上的“分子”点值写入 buf
-		if _, err := iop.Evaluate(
-			allConstraints,
-			buf,
-			iop.Form{Basis: iop.Lagrange, Layout: iop.Regular},
-			s.x...,
-		); err != nil {
-			return nil, err
-		}
-
-		// 7.7 把 buf 写入 cres 中该 coset 对应的位置（bit reverse）
-		wgBuf.Add(1)
-		go func(ci int) {
-			for j := 0; j < int(n); j++ {
-				cres[bits.Reverse64(uint64(rho*j+ci))>>mm] = buf[j]
-			}
-			wgBuf.Done()
-		}(ci)
-
-		// 7.8 撤掉本 coset 对 blinding 系数引入的 (coset^n - 1)
-		cosetExponentiatedToNMinusOne.Inverse(&cosetExponentiatedToNMinusOne)
-		for _, q := range s.bp {
-			cq := q.Coefficients()
-			for j := 0; j < len(cq); j++ {
-				cq[j].Mul(&cq[j], &cosetExponentiatedToNMinusOne)
-			}
-		}
-	}
-
-	// 8. 全局回滚 scale everything back（GPU 优先，内含 CPU fallback）
-	go s.scaleEverythingBackGPUorCPU(shifters, nil, nil)
-
-	// 9. 等待所有 coset 写入 cres 完成
-	wgBuf.Wait()
-
-	res := iop.NewPolynomial(&cres, iop.Form{Basis: iop.LagrangeCoset, Layout: iop.BitReverse})
-	return res, nil
-}
+// 	return retErr
+// }
 
 // batchInvert modifies in place vec, with vec[i]<-vec[i]^{-1}, using
 // the Montgomery batch inversion trick. We don't use gnark-crypto's batchInvert
@@ -3392,3 +4078,61 @@ func (s *instance) scaleEverythingBackGPUorCPU(
 
 	close(s.chRestoreLRO)
 }
+
+// // GPU/CPU 二选一的“全局回滚”实现：把所有多项式的系数乘以 cs^j，并统一回到 Canonical+Regular。
+// //
+// // 注意：
+// //   - 必须跳过 ZS（id_ZS）以及已经置 nil 的 Qk（id_Qk）
+// //   - 尽可能使用 GPU；失败则回退 CPU
+// //   - 语义与参考实现一致：在 CPU fallback 中仍然是
+// //     p.ToCanonical(s.domain0, 8).ToRegular() 再做 cs^j 缩放
+// //     在 GPU 路径中：用 INTT 把 Lagrange 评估值变回 Canonical 系数，再做 cs^j 缩放。
+// func (s *instance) scaleEverythingBackGPUorCPU(
+// 	shifters []fr.Element,
+// 	poly2row map[*iop.Polynomial]int,
+// 	devX []icicle_core.DeviceSlice,
+// ) {
+// 	// 1. 和原逻辑保持一致：先把 ZS / Qk 清掉
+// 	s.x[id_ZS] = nil
+// 	s.x[id_Qk] = nil
+
+// 	// 2. 计算 cs = (∏ shifters)^(-1)
+// 	var cs fr.Element
+// 	cs.Set(&shifters[0])
+// 	for i := 1; i < len(shifters); i++ {
+// 		cs.Mul(&cs, &shifters[i])
+// 	}
+// 	cs.Inverse(&cs)
+
+// 	// 3. 预计算 cs^j：accList[j] = cs^j，长度 = |domain0|
+// 	n := int(s.domain0.Cardinality)
+// 	accList := make([]fr.Element, n)
+// 	{
+// 		var acc fr.Element
+// 		acc.SetOne()
+// 		for j := 0; j < n; j++ {
+// 			accList[j].Set(&acc)
+// 			acc.Mul(&acc, &cs)
+// 		}
+// 	}
+
+// 	// 4. CPU fallback：严格按照参考实现语义：
+// 	//    对每个 poly 先 ToCanonical(s.domain0).ToRegular()，再做 cs^j 缩放。
+// 	batchApply(s.x, func(p *iop.Polynomial) {
+// 		if p == nil {
+// 			return
+// 		}
+// 		p.ToCanonical(s.domain0, 8).ToRegular()
+// 		scalePowers(p, cs)
+// 	})
+
+// 	// 5. blinding 多项式也要乘 cs^j（参考实现是用 CPU 做的）
+// 	for _, q := range s.bp {
+// 		if q == nil {
+// 			continue
+// 		}
+// 		scalePowers(q, cs)
+// 	}
+
+// 	close(s.chRestoreLRO)
+// }

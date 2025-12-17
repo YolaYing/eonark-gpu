@@ -587,3 +587,56 @@ func OnDeviceCommitStreamWithPrecompute(
 	res := blsProjectiveToGnarkAffine(out[0])
 	return kzg.Digest(res), icicle_runtime.Success
 }
+
+// NttBatchCosetOnDeviceStream:
+// 对 batchSize 条向量同时做 coset-NTT（forward）。
+// dataBatch: [batchSize][vecLen] row-major flatten。
+// cosetGen: 用 gnark fr.Element 传进来，内部转成 icicle 的 [8]uint32。
+func NttBatchCosetOnDeviceStream(
+	dataBatch icicle_core.DeviceSlice,
+	batchSize int,
+	cosetGen fr.Element,
+	stream icicle_runtime.Stream,
+) icicle_runtime.EIcicleError {
+
+	cfg := icicle_ntt.GetDefaultNttConfig()
+	cfg.StreamHandle = stream
+	cfg.IsAsync = true
+
+	cfg.BatchSize = int32(batchSize)
+	cfg.ColumnsBatch = false
+	cfg.Ordering = icicle_core.KNN
+
+	cfg.CosetGen = CosetGenToIcicle(cosetGen)
+
+	return icicle_ntt.Ntt(
+		dataBatch,
+		icicle_core.KForward,
+		&cfg,
+		dataBatch, // in-place
+	)
+}
+
+func INttBatchCosetOnDeviceStream(
+	dataBatch icicle_core.DeviceSlice,
+	batchSize int,
+	cosetGen fr.Element,
+	stream icicle_runtime.Stream,
+) icicle_runtime.EIcicleError {
+
+	cfg := icicle_ntt.GetDefaultNttConfig()
+	cfg.StreamHandle = stream
+	cfg.IsAsync = true
+
+	cfg.BatchSize = int32(batchSize)
+	cfg.ColumnsBatch = false
+	cfg.Ordering = icicle_core.KNN
+	cfg.CosetGen = CosetGenToIcicle(cosetGen)
+
+	return icicle_ntt.Ntt(
+		dataBatch,
+		icicle_core.KInverse,
+		&cfg,
+		dataBatch,
+	)
+}
